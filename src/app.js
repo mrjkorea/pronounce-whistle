@@ -396,36 +396,50 @@ function noteCue() {
   return lang === 'ko' ? '이 질문을 한 번만 말하세요.' : 'Say this question one time.';
 }
 
+function wordMatched(word) {
+  if (!word) return false;
+  if (word.match != null) return !!word.match;
+  return (word.score || 0) >= 1;
+}
+
 function wordChipsHtml(words) {
   if (!words || !words.length) return '';
   const chips = words.map((w) => {
-    const match = w.match != null ? !!w.match : (w.score || 0) >= 1;
-    const cls = match ? 'good' : 'bad';
+    const cls = wordMatched(w) ? 'good' : 'bad';
     return `<span class="word-chip ${cls}">${escapeHtml(w.word)}</span>`;
   }).join('');
   return `<div class="chips">${chips}</div>`;
 }
 
-function englishRevealed(saved) {
-  return !!(saved && saved.pass === false);
+function coloredSentenceHtml(english, words) {
+  if (!words || !words.length) return escapeHtml(english);
+  return words.map((w) => {
+    const cls = wordMatched(w) ? 'word-pass' : 'word-fail';
+    return `<span class="${cls}">${escapeHtml(w.word)}</span>`;
+  }).join(' ');
 }
 
-function englishCueHtml(english, className) {
+function englishRevealed(saved) {
+  return !!saved;
+}
+
+function englishCueHtml(english, className, saved) {
   const triple = needsTripleHint(english) ? '<p class="triple-hint">Say it 3 times.</p>' : '';
-  return `<p class="${className}">${escapeHtml(english)}</p>${triple}`;
+  const sentence = coloredSentenceHtml(english, saved && saved.words);
+  const heard = saved && saved.heard != null ? `<p class="meta heard">Heard: ${escapeHtml(saved.heard)}</p>` : '';
+  return `<p class="${className}">${sentence}</p>${heard}${triple}`;
 }
 
 function partResultHtml(saved) {
   if (!saved) return '';
-  const verdict = saved.pass ? 'Pass' : 'Not yet';
-  const cls = saved.pass ? 'pass' : 'fail';
   const pct = saved.scorePct != null ? saved.scorePct : Math.round((saved.score || 0) * 100);
-  const heard = saved.heard != null ? `<p class="meta heard">Heard: ${escapeHtml(saved.heard)}</p>` : '';
+  const verdict = saved.pass
+    ? `<p class="verdict pass">PASS</p><p class="meta">${pct}</p>`
+    : `<p class="verdict fail">Not yet · ${pct}</p>`;
   const reason = saved.reason ? `<p class="meta">${escapeHtml(saved.reason)}</p>` : '';
-  const chips = englishRevealed(saved) ? wordChipsHtml(saved.words) : '';
+  const chips = wordChipsHtml(saved.words);
   return `<div class="after show">
-    <p class="verdict ${cls}">${verdict} · ${pct}</p>
-    ${heard}
+    ${verdict}
     ${chips}
     ${reason}
   </div>`;
@@ -457,7 +471,7 @@ function renderSharedQuestion(bookId, unit, scores, ready, view) {
   const saved = scores[sk];
   const allowed = view.allow ? !!view.allow[sk] : !!ready;
   const hideEnglish = !!view.forceHideEnglish;
-  const prompt = !hideEnglish && englishRevealed(saved) ? englishCueHtml(plan.question, 'en-prompt') : '';
+  const prompt = !hideEnglish && englishRevealed(saved) ? englishCueHtml(plan.question, 'en-prompt', saved) : '';
   const meaning = questionCue(plan.question);
   const meaningHtml = meaning ? `<p class="l1-prompt">${escapeHtml(meaning)}</p>` : '';
   const result = view.hideVerdict ? '' : partResultHtml(saved);
@@ -521,7 +535,7 @@ function lineArticleHtml(line, unit, index, scores, ready, view) {
     const saved = scores[skey];
     const allowed = view.allow ? !!view.allow[skey] : !!ready;
     const revealed = !view.forceHideEnglish && englishRevealed(saved);
-    const cue = revealed ? englishCueHtml(p.english, 'part-text') : '';
+    const cue = revealed ? englishCueHtml(p.english, 'part-text', saved) : '';
     const audioRel = p.audio || questionAudioRel(p.english);
     const micBtn = micButtonHtml(skey, item.id, p.key, p.english, audioRel, allowed, ready, view.micLabel);
     const recorded = checkHtml(view.recorded && view.recorded[skey]);

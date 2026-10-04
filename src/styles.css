@@ -352,8 +352,16 @@ h1 {
   margin: 0 0 6px;
 }
 
-.verdict.pass { color: var(--pass); }
+.verdict.pass {
+  color: var(--pass);
+  font-size: 64px;
+  line-height: 0.95;
+  letter-spacing: 0.06em;
+}
 .verdict.fail { color: var(--fail); }
+
+.word-pass { color: var(--pass); }
+.word-fail { color: var(--fail); }
 
 .meta, .english {
   margin: 0 0 8px;

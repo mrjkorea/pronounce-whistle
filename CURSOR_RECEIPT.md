@@ -21,3 +21,5 @@ The clip `audio/hear/it-is-here.mp3` transcribed as `It is here.`
 ## Not here
 
 Phonon-2 is not in this folder. That model has no browser engine.
+
+After a saved try, the full English sentence shows on pass and fail, each word green or red, with large PASS or "Not yet", the heard text under the sentence, and word chips on every saved result.
