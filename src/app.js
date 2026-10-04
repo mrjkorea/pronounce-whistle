@@ -1,0 +1,1306 @@
+import { decodeAudioToMono, audioStats, trimSilence, capSpeechWindow } from './audio.js';
+import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261004-whistle';
+import { sheetLines } from './sheet.js';
+import {
+  FLOW_STORAGE_KEY,
+  LOCK_TEXT,
+  advanceFlow,
+  canStartMic,
+  isLocked,
+  lineOpenFor,
+  markRushRecorded,
+  normalizeFlow,
+  noteAttempt,
+  noteRushGrade,
+  noteTeacherPass,
+  reconcileFlow,
+  resultsView,
+  startTimer,
+  stopTimer,
+  sumWords,
+  timerRunning,
+  timerSeconds,
+  tryTeacherPassword,
+} from './flow.js';
+
+const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
+const LOCAL_HEAR = new Set([
+  'audio/hear/it-is-here.mp3',
+  'audio/hear/it-is-there.mp3',
+]);
+const SPEECH_CAP_MS = 12000;
+const SCORE_KEY = 'day4-pronounce-scores-v2';
+const LANG_KEY = 'day4-ui-lang';
+const UI_LANGS = [
+  ['en', 'English'],
+  ['ko', '한국어'],
+  ['zh-Hans', '中文'],
+  ['ja', '日本語'],
+  ['es', 'Español'],
+  ['hi', 'हिन्दी'],
+  ['de', 'Deutsch'],
+  ['vi', 'Tiếng Việt'],
+  ['pt-BR', 'Português'],
+  ['id', 'Bahasa Indonesia'],
+  ['fr', 'Français'],
+  ['ar', 'العربية'],
+  ['tr', 'Türkçe'],
+  ['it', 'Italiano'],
+  ['pl', 'Polski'],
+];
+let l1Pack = null;
+const BOOK_ORDER = ['basic_a', 'basic_b', 'basic_c', 'int3a', 'int3b', 'int3c', 'int2a', 'int2b', 'int2c'];
+
+const QUESTION_CODES = {
+  HITW: 'How is the weather?',
+  WCYD: 'What can you draw?',
+  WDYW: 'What do you want?',
+  WIMP: 'Where is my phone?',
+  WDIIT: 'What day is it today?',
+  'WTII(N)': 'What time is it?',
+  WTII: 'What time is it?',
+  WFDYL: 'What flavor do you like?',
+  WITB: 'What is this bug?',
+  HWIYN: 'How will I yell your name?',
+  WGAYI: 'What grade are you in?',
+  WFAT: 'What fruit are these?',
+  WDYH: 'What do you have?',
+};
+
+const SILENCE_MS = 1200;
+const SILENCE_GRACE_MS = 1600;
+const SILENCE_CHECK_MS = 80;
+const SILENCE_RMS = 0.008;
+const MAX_RECORD_MS = 60000;
+
+const appEl = typeof document !== 'undefined' ? document.getElementById('app') : null;
+const modelLabel = typeof document !== 'undefined' ? document.getElementById('modelLabel') : null;
+const modelFill = typeof document !== 'undefined' ? document.getElementById('modelFill') : null;
+const modelTrack = typeof document !== 'undefined' ? document.getElementById('modelTrack') : null;
+
+let books = [];
+let byId = new Map();
+let whistleModule = null;
+let checkerReady = false;
+let modelError = '';
+let capture = null;
+let silenceTimer = null;
+let silenceNodes = null;
+let gradingScoreKey = null;
+let part1Busy = false;
+let rushInFlight = 0;
+let chainTail = Promise.resolve();
+let clockTimer = null;
+let teacherMiss = {};
+
+function koreanCode(korean) {
+  const m = String(korean || '').match(/^([A-Z0-9()]+)\?\s*/);
+  return m ? m[1] : null;
+}
+
+function analyzeUnit(unit) {
+  const items = unit.items;
+  const codes = items.map((it) => koreanCode(it.korean));
+  const coded = codes.filter(Boolean);
+  const allSameCode = coded.length === items.length && coded.every((c) => c === coded[0]);
+  const code = allSameCode ? coded[0] : null;
+  if (code === 'ITA') return { mode: 'ita-rows' };
+  if (code === 'CIPO') return { mode: 'cipo-rows' };
+  if (code && code !== 'ITA' && QUESTION_CODES[code]) {
+    return { mode: 'shared', question: QUESTION_CODES[code], code };
+  }
+  const titleQ = unit.title.trim().endsWith('?');
+  const allAnswers = items.every((it) => !it.english.trim().endsWith('?'));
+  if (titleQ && allAnswers) return { mode: 'shared', question: unit.title.trim(), code: null };
+  return { mode: 'plain' };
+}
+
+function sharedScoreKey(bookId, unitId) {
+  return `${bookId}__${unitId}__shared_question`;
+}
+
+function itaQuestion(item) {
+  const alt = (item.alts || []).find((a) => String(a).trim().endsWith('?'));
+  if (alt) return String(alt).trim();
+  const en = item.english.trim();
+  const m = en.match(/^It is (an?|a) (.+)$/i);
+  if (m) return `Is this ${m[1]} ${m[2]}?`;
+  return en;
+}
+
+function cipoAnswer(item) {
+  const alt = (item.alts || []).find((a) => String(a).trim());
+  return alt ? String(alt).trim() : '';
+}
+
+function hearAnswerRel(text) {
+  const slug = String(text).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return `audio/hear/${slug}.mp3`;
+}
+
+function rowParts(item, unit) {
+  const plan = analyzeUnit(unit);
+  if (plan.mode === 'ita-rows') {
+    return [
+      { key: 'question', label: 'Question', english: itaQuestion(item), audio: null },
+      { key: 'answer', label: 'Answer', english: item.english, audio: item.audio },
+    ];
+  }
+  if (plan.mode === 'cipo-rows') {
+    const ans = cipoAnswer(item);
+    return [
+      { key: 'question', label: 'Question', english: item.english.trim(), audio: item.audio },
+      { key: 'answer', label: 'Answer', english: ans, audio: ans ? hearAnswerRel(ans) : item.audio },
+    ];
+  }
+  if (plan.mode === 'shared') {
+    return [{ key: 'answer', label: 'Answer', english: item.english, audio: item.audio }];
+  }
+  const en = item.english.trim();
+  if (en.endsWith('?')) {
+    return [{ key: 'line', label: 'Question', english: en, audio: item.audio }];
+  }
+  return [{ key: 'line', label: 'Answer', english: en, audio: item.audio }];
+}
+
+function scoreStorageKey(itemId, partKey) {
+  return partKey === 'line' ? itemId : `${itemId}::${partKey}`;
+}
+
+function scoringTarget(english) {
+  const toks = wordsOf(english);
+  if (toks.length === 1) return `${toks[0]} ${toks[0]} ${toks[0]}`;
+  return english;
+}
+
+function needsTripleHint(english) {
+  return wordsOf(english).length === 1;
+}
+
+function questionAudioRel(text) {
+  const slug = String(text).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return `audio/hear/questions/${slug}.mp3`;
+}
+
+function itemRowPassed(item, unit, scores) {
+  const plan = analyzeUnit(unit);
+  if (plan.mode === 'shared') {
+    const sk = sharedScoreKey(unit._bookId, unit.id);
+    if (!scores[sk] || !scores[sk].pass) return false;
+  }
+  return rowParts(item, unit).every((p) => {
+    const key = scoreStorageKey(item.id, p.key);
+    return scores[key] && scores[key].pass;
+  });
+}
+
+
+// Jay 28SEP2026: ONE score book — pronounce grades log here too.
+function logToOneBook(itemId, graded) {
+  const auth = window.MRJ_AUTH;
+  const who = auth && typeof auth.student === 'function' ? String(auth.student() || '').trim() : '';
+  if (!window.MRJ_SCORES || !graded || !who || !itemId) return;
+  window.MRJ_SCORES.post({
+    student: who,
+    program: 'pronounce',
+    appName: 'Pronounce · Whistle',
+    source: 'pronounce',
+    itemId: 'whistle:' + itemId,
+    itemType: 'pronunciation',
+    scoreValue: Number(graded.scorePct || 0),
+    scoreMax: 100,
+    scorePct: Number(graded.scorePct || 0),
+    correctness: graded.pass ? 'correct' : 'incorrect',
+    metadata: { english: graded.english || '', weak: graded.weak || [] },
+  });
+}
+
+function loadScores() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SCORE_KEY) || '{}');
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveScores(scores) {
+  localStorage.setItem(SCORE_KEY, JSON.stringify(scores));
+}
+
+function flowKey(bookId, unitId) {
+  return bookId + '/' + unitId;
+}
+
+function loadFlowBook() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FLOW_STORAGE_KEY) || '{}');
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function loadUnitFlow(bookId, unitId) {
+  return normalizeFlow(loadFlowBook()[flowKey(bookId, unitId)]);
+}
+
+function saveUnitFlow(bookId, unitId, flow) {
+  const all = loadFlowBook();
+  all[flowKey(bookId, unitId)] = flow;
+  localStorage.setItem(FLOW_STORAGE_KEY, JSON.stringify(all));
+}
+
+function chain(fn) {
+  const next = chainTail.then(fn, fn);
+  chainTail = next.then(() => {}, () => {});
+  return next;
+}
+
+function setProgress(frac, text) {
+  const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+  modelFill.style.width = pct + '%';
+  modelLabel.textContent = text;
+}
+
+function markModelReady() {
+  modelLabel.classList.add('done');
+  modelTrack.classList.add('done');
+}
+
+async function bootModel() {
+  try {
+    setProgress(0.02, 'Loading Whistle…');
+    whistleModule = await loadWhistle(window.createNeedle, (frac) => {
+      setProgress(0.05 + frac * 0.9, 'Loading Whistle… ' + Math.round(frac * 100) + '%');
+    });
+    checkerReady = true;
+    setProgress(1, 'Whistle 16.9 MB');
+    markModelReady();
+    render();
+  } catch (err) {
+    modelError = err && err.message ? err.message : String(err);
+    modelLabel.textContent = 'Whistle did not start. ' + modelError;
+    console.error(err);
+    render();
+  }
+}
+
+async function loadContent() {
+  const manifest = await fetch('content/manifest.json').then((r) => r.json());
+  const files = await Promise.all(BOOK_ORDER.map(async (id) => {
+    const meta = manifest.books.find((b) => b.id === id);
+    const data = await fetch('content/' + id + '.json').then((r) => r.json());
+    const units = data.units.map((u) => ({ ...u, _bookId: id }));
+    return { id, label: (meta && meta.label) || data.label, units };
+  }));
+  books = files;
+  byId = new Map(files.map((b) => [b.id, b]));
+}
+
+function route() {
+  const hash = (location.hash || '#/').replace(/^#/, '');
+  const unit = hash.match(/^\/book\/([a-z0-9_]+)\/unit\/([a-z0-9_]+)$/);
+  if (unit) return { name: 'sheet', bookId: unit[1], unitId: unit[2] };
+  const book = hash.match(/^\/book\/([a-z0-9_]+)$/);
+  if (book) return { name: 'units', bookId: book[1] };
+  return { name: 'home' };
+}
+
+function linePassed(line, unit, scores) {
+  if (line.kind === 'extra') {
+    const saved = scores[line.id];
+    return !!(saved && saved.pass);
+  }
+  return itemRowPassed(line.item, unit, scores);
+}
+
+function bookProgress(book) {
+  const scores = loadScores();
+  let n = 0;
+  let pass = 0;
+  for (const unit of book.units) {
+    const lines = sheetLines(book.id, unit);
+    n += lines.length;
+    for (const line of lines) {
+      if (linePassed(line, unit, scores)) pass += 1;
+    }
+  }
+  return { n, pass };
+}
+
+function renderHome() {
+  const cards = books.map((book) => {
+    const prog = bookProgress(book);
+    return `<a class="book" href="#/book/${book.id}">${book.label}<small>${prog.pass} / ${prog.n} passed</small></a>`;
+  }).join('');
+  appEl.innerHTML = `<h1>Pronounce · Whistle</h1><p class="lead">Tap your book.</p><div class="books">${cards}</div>`;
+}
+
+function renderUnits(bookId) {
+  const book = byId.get(bookId);
+  if (!book) { appEl.innerHTML = '<p class="lead">That book is not here.</p>'; return; }
+  const scores = loadScores();
+  const rows = book.units.map((unit) => {
+    const lines = sheetLines(book.id, unit);
+    const passed = lines.filter((line) => linePassed(line, unit, scores)).length;
+    return `<a class="unit" href="#/book/${book.id}/unit/${unit.id}">${unit.title}<small>${passed} / ${lines.length}</small></a>`;
+  }).join('');
+  appEl.innerHTML = `<a class="back" href="#/">← Books</a><h1>${book.label}</h1><p class="lead">Tap the unit you are studying.</p><div class="units">${rows}</div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function currentLang() {
+  const code = localStorage.getItem(LANG_KEY) || 'ko';
+  return UI_LANGS.some(([id]) => id === code) ? code : 'ko';
+}
+
+function applyLangDir() {
+  const code = currentLang();
+  document.documentElement.lang = code;
+  document.documentElement.dir = code === 'ar' ? 'rtl' : 'ltr';
+}
+
+function fillLangMenu() {
+  const sel = document.getElementById('langMenu');
+  if (!sel) return;
+  const cur = currentLang();
+  sel.innerHTML = UI_LANGS.map(([code, name]) => (
+    `<option value="${code}"${code === cur ? ' selected' : ''}>${name}</option>`
+  )).join('');
+}
+
+function lineCue(item) {
+  if (!item) return '';
+  const lang = currentLang();
+  if (lang === 'ko') return item.korean || '';
+  const row = l1Pack && l1Pack.lines && l1Pack.lines[item.id];
+  if (row && row[lang]) return row[lang];
+  return item.korean || '';
+}
+
+function questionCue(english) {
+  const lang = currentLang();
+  const row = l1Pack && l1Pack.questions && l1Pack.questions[english];
+  if (row && row[lang]) return row[lang];
+  return lang === 'en' ? english : '';
+}
+
+function noteCue() {
+  const lang = currentLang();
+  const note = l1Pack && l1Pack.note;
+  if (note && note[lang]) return note[lang];
+  return lang === 'ko' ? '이 질문을 한 번만 말하세요.' : 'Say this question one time.';
+}
+
+function wordChipsHtml(words) {
+  if (!words || !words.length) return '';
+  const chips = words.map((w) => {
+    const match = w.match != null ? !!w.match : (w.score || 0) >= 1;
+    const cls = match ? 'good' : 'bad';
+    return `<span class="word-chip ${cls}">${escapeHtml(w.word)}</span>`;
+  }).join('');
+  return `<div class="chips">${chips}</div>`;
+}
+
+function englishRevealed(saved) {
+  return !!(saved && saved.pass === false);
+}
+
+function englishCueHtml(english, className) {
+  const triple = needsTripleHint(english) ? '<p class="triple-hint">Say it 3 times.</p>' : '';
+  return `<p class="${className}">${escapeHtml(english)}</p>${triple}`;
+}
+
+function partResultHtml(saved) {
+  if (!saved) return '';
+  const verdict = saved.pass ? 'Pass' : 'Not yet';
+  const cls = saved.pass ? 'pass' : 'fail';
+  const pct = saved.scorePct != null ? saved.scorePct : Math.round((saved.score || 0) * 100);
+  const heard = saved.heard != null ? `<p class="meta heard">Heard: ${escapeHtml(saved.heard)}</p>` : '';
+  const reason = saved.reason ? `<p class="meta">${escapeHtml(saved.reason)}</p>` : '';
+  const chips = englishRevealed(saved) ? wordChipsHtml(saved.words) : '';
+  return `<div class="after show">
+    <p class="verdict ${cls}">${verdict} · ${pct}</p>
+    ${heard}
+    ${chips}
+    ${reason}
+  </div>`;
+}
+
+function micButtonHtml(skey, itemId, partKey, english, audioRel, allowed, ready, label) {
+  const text = label && label !== 'Mic' ? label : (ready ? 'Mic' : 'Wait');
+  const itemAttr = itemId ? ` data-item-id="${escapeHtml(itemId)}"` : '';
+  const partAttr = partKey ? ` data-part-key="${escapeHtml(partKey)}"` : '';
+  return `<button type="button" class="mic" data-score-key="${escapeHtml(skey)}"${itemAttr}${partAttr} data-grade-text="${escapeHtml(english)}" data-audio-rel="${escapeHtml(audioRel)}" ${allowed && ready ? '' : 'disabled'}>${text}</button>`;
+}
+
+function askHtml(show) {
+  if (!show) return '';
+  const text = LOCK_TEXT === 'Please ask your teacher for help.' ? LOCK_TEXT : 'Please ask your teacher for help.';
+  return `<p class="ask-teacher">${escapeHtml(text)}</p>`;
+}
+
+function checkHtml(show) {
+  if (!show) return '';
+  return '<span class="got-it" aria-label="Recorded">✓</span>';
+}
+
+function renderSharedQuestion(bookId, unit, scores, ready, view) {
+  const plan = analyzeUnit(unit);
+  if (plan.mode !== 'shared') return '';
+  view = view || {};
+  const sk = sharedScoreKey(bookId, unit.id);
+  const saved = scores[sk];
+  const allowed = view.allow ? !!view.allow[sk] : !!ready;
+  const hideEnglish = !!view.forceHideEnglish;
+  const prompt = !hideEnglish && englishRevealed(saved) ? englishCueHtml(plan.question, 'en-prompt') : '';
+  const meaning = questionCue(plan.question);
+  const meaningHtml = meaning ? `<p class="l1-prompt">${escapeHtml(meaning)}</p>` : '';
+  const result = view.hideVerdict ? '' : partResultHtml(saved);
+  const gradingShared = gradingScoreKey === sk && !view.hideVerdict;
+  const gradeBar = gradingShared ? '<div class="grade-bar shared-grade show"><div class="grade-fill"></div></div>' : '';
+  const doneCls = saved && saved.pass ? 'done' : '';
+  const recorded = view.recorded && view.recorded[sk];
+  const mic = micButtonHtml(sk, '', '', plan.question, questionAudioRel(plan.question), allowed, ready, view.micLabel);
+  return `<section class="shared-q ${doneCls}" data-shared="${escapeHtml(sk)}">
+    <p class="shared-note">${escapeHtml(noteCue())}</p>
+    ${meaningHtml}
+    ${prompt}
+    <div class="mic-cell">${checkHtml(recorded)}${mic}</div>
+    ${askHtml(view.locked && view.locked[sk])}
+    ${result}
+    ${gradeBar}
+  </section>`;
+}
+
+function hearSrc(rel) {
+  if (!rel) return '';
+  if (LOCAL_HEAR.has(rel)) return rel;
+  return HEAR_BASE + rel;
+}
+
+function koHtml(korean, imageRel, local, extraHtml) {
+  const src = imageRel ? (local ? imageRel : HEAR_BASE + imageRel) : '';
+  const pic = src ? `<img class="row-pic" alt="" src="${escapeHtml(src)}">` : '';
+  return `<div class="ko-wrap">${pic}<div class="ko-text"><div class="ko">${escapeHtml(korean)}</div>${extraHtml || ''}</div></div>`;
+}
+
+function lineParts(line, unit) {
+  if (line.kind === 'extra') {
+    return [{ key: 'line', label: 'Answer', english: line.english, audio: line.audio }];
+  }
+  const item = line.item || {
+    id: line.id,
+    korean: line.korean,
+    english: line.english,
+    audio: line.audio,
+    image: line.image,
+  };
+  return rowParts(item, unit);
+}
+
+function lineArticleHtml(line, unit, index, scores, ready, view) {
+  view = view || {};
+  const item = line.item || {
+    id: line.id,
+    korean: line.korean,
+    english: line.english,
+    audio: line.audio,
+    image: line.image,
+  };
+  const parts = lineParts(line, unit);
+  const multi = parts.length > 1;
+  const grading = !view.hideVerdict && gradingScoreKey && parts.some((p) => scoreStorageKey(item.id, p.key) === gradingScoreKey);
+  const imageRel = line.image || item.image || '';
+  const partBlocks = parts.map((p) => {
+    const skey = scoreStorageKey(item.id, p.key);
+    const saved = scores[skey];
+    const allowed = view.allow ? !!view.allow[skey] : !!ready;
+    const revealed = !view.forceHideEnglish && englishRevealed(saved);
+    const cue = revealed ? englishCueHtml(p.english, 'part-text') : '';
+    const audioRel = p.audio || questionAudioRel(p.english);
+    const micBtn = micButtonHtml(skey, item.id, p.key, p.english, audioRel, allowed, ready, view.micLabel);
+    const recorded = checkHtml(view.recorded && view.recorded[skey]);
+    const ask = askHtml(view.locked && view.locked[skey]);
+    const result = view.hideVerdict ? '' : partResultHtml(saved);
+    if (!multi) {
+      return {
+        main: koHtml(lineCue(item), imageRel, line.local, cue + ask),
+        micBtn: recorded + micBtn,
+        saved,
+        result,
+      };
+    }
+    const label = revealed ? `<div class="part-label">${escapeHtml(p.label)}</div>` : '';
+    return `<div class="part" data-part="${escapeHtml(p.key)}">
+      <div>
+        ${label}
+        ${cue}
+        ${ask}
+        ${result}
+      </div>
+      <div class="mic-cell">${recorded}${micBtn}</div>
+    </div>`;
+  });
+  let body;
+  let tail = '';
+  if (multi) {
+    body = `<div class="row-parts">${koHtml(lineCue(item), imageRel, line.local)}${partBlocks.join('')}</div>`;
+  } else {
+    const single = partBlocks[0];
+    body = `<div class="row-main">${single.main}</div><div class="mic-cell">${single.micBtn}</div>`;
+    tail = single.result;
+  }
+  const gradeBar = grading ? '<div class="grade-bar show"><div class="grade-fill"></div></div>' : '';
+  return `<article class="row" data-id="${escapeHtml(item.id)}">
+    <div class="num">${index + 1}</div>
+    ${body}
+    ${tail}
+    ${gradeBar}
+  </article>`;
+}
+
+function speakTargets(bookId, unit) {
+  const out = [];
+  const plan = analyzeUnit(unit);
+  if (plan.mode === 'shared') {
+    out.push({
+      id: sharedScoreKey(bookId, unit.id),
+      english: plan.question,
+      korean: '이 질문을 한 번만 말하세요.',
+      image: '',
+      local: false,
+      audio: questionAudioRel(plan.question),
+      itemId: '',
+      partKey: 'shared',
+      shared: true,
+    });
+  }
+  const lines = sheetLines(bookId, unit);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const parts = lineParts(line, unit);
+    const item = line.item || {
+      id: line.id,
+      korean: line.korean,
+      english: line.english,
+      audio: line.audio,
+      image: line.image,
+    };
+    for (let p = 0; p < parts.length; p++) {
+      const part = parts[p];
+      out.push({
+        id: scoreStorageKey(item.id, part.key),
+        english: part.english,
+        korean: item.korean,
+        image: line.image || item.image || '',
+        local: !!line.local,
+        audio: part.audio || questionAudioRel(part.english),
+        itemId: item.id,
+        partKey: part.key,
+        shared: false,
+        line,
+      });
+    }
+  }
+  return out;
+}
+
+function speakWordCount(bookId, unit) {
+  return sumWords(speakTargets(bookId, unit).map((target) => target.english));
+}
+
+function sheetView(flow, targets) {
+  const allow = {};
+  const locked = {};
+  const recorded = {};
+  const running = timerRunning(flow);
+  for (let i = 0; i < targets.length; i++) {
+    const id = targets[i].id;
+    allow[id] = checkerReady && canStartMic({
+      phase: flow.phase,
+      recording: !!capture,
+      grading: part1Busy || rushInFlight > 0,
+      timerRunning: running,
+      lineOpen: lineOpenFor(flow, id),
+    });
+    if (flow.phase === 'part1' && isLocked(flow, id)) locked[id] = true;
+    if (flow.rushRecorded[id]) recorded[id] = true;
+  }
+  const rush = flow.phase === 'part2' || flow.phase === 'results';
+  return {
+    allow,
+    locked,
+    recorded,
+    forceHideEnglish: flow.phase !== 'part1',
+    hideVerdict: rush,
+    micLabel: flow.phase === 'teacher' ? 'Teacher mic' : 'Mic',
+  };
+}
+
+function clockSeconds(flow, now) {
+  const limit = flow.part2.limitSec || 60;
+  if (!flow.part2.startedAt || flow.part2.stoppedAt || flow.phase === 'results') return limit;
+  const leftMs = limit * 1000 - (now - flow.part2.startedAt);
+  return Math.max(0, Math.ceil(leftMs / 1000));
+}
+
+function resultsHtml(flow, targets) {
+  const view = resultsView(flow, targets);
+  const skips = view.skipped.map((line) => `<p class="skip-line">${escapeHtml(line.label)} <b>skipped</b></p>`).join('');
+  const said = view.teacherSaid.map((line) => `<p class="teacher-line">${escapeHtml(line.label)} <b>teacher</b></p>`).join('');
+  return `<section class="part-results">
+    <h2>Results</h2>
+    <p>Seconds used: ${view.secondsUsed}. Limit ${view.limitSec}.</p>
+    <p>Recorded ${view.recorded} / ${view.total}</p>
+    <p>Part 1 pronunciation: ${view.passed} passed</p>
+    ${skips}
+    ${said}
+  </section>`;
+}
+
+function rushBarHtml(flow) {
+  const limit = flow.part2.limitSec || timerSecondsSafe(flow);
+  const started = !!flow.part2.startedAt && !flow.part2.stoppedAt && flow.phase === 'part2';
+  const showStart = flow.phase === 'part2' && !flow.part2.startedAt;
+  const clock = flow.phase === 'results' ? '0' : String(started ? clockSeconds(flow, Date.now()) : limit);
+  return `<section class="rush">
+    <p class="rush-limit">Limit ${limit} seconds</p>
+    <p class="rush-clock" id="rushClock">${clock}</p>
+    ${showStart ? `<button type="button" id="rushStart" ${checkerReady ? '' : 'disabled'}>Start</button>` : ''}
+    ${started ? '<button type="button" id="rushStop">Stop</button>' : ''}
+  </section>`;
+}
+
+function timerSecondsSafe(flow) {
+  return flow.part2.limitSec === 90 ? 90 : 60;
+}
+
+function teacherMeaning(target) {
+  if (!target.shared) return '';
+  const meaning = questionCue(target.english);
+  const meaningHtml = meaning ? `<p class="l1-prompt">${escapeHtml(meaning)}</p>` : '';
+  return `<p class="shared-note">${escapeHtml(noteCue())}</p>${meaningHtml}`;
+}
+
+function teacherKorean(target) {
+  if (target.shared) return '';
+  return lineCue({
+    id: target.itemId || target.id,
+    korean: target.korean || '',
+  });
+}
+
+function teacherBlockHtml(targets, ready, flow) {
+  const stuck = targets.filter((target) => lineOpenFor(flow, target.id));
+  const rows = stuck.map((target) => {
+    const miss = teacherMiss[target.id] ? '<p class="verdict fail">Not yet</p>' : '';
+    const allowed = checkerReady && canStartMic({
+      phase: 'teacher',
+      recording: !!capture,
+      grading: part1Busy || rushInFlight > 0,
+      timerRunning: false,
+      lineOpen: true,
+    });
+    const mic = micButtonHtml(target.id, target.itemId, target.partKey, target.english, target.audio, allowed, ready, 'Teacher mic');
+    return `<article class="row teacher-row" data-id="${escapeHtml(target.id)}">
+      ${koHtml(teacherKorean(target), target.image, target.local, teacherMeaning(target))}
+      <div class="mic-cell">${mic}</div>
+      ${miss}
+    </article>`;
+  }).join('');
+  return `<form id="teacherGate" class="teacher-gate" method="post" action="#/" autocomplete="off">
+      <label class="gate-label">Password
+        <input type="password" id="teacherPassword" autocomplete="off" spellcheck="false">
+      </label>
+      <button type="submit" class="gate-go">Enter</button>
+      <p class="gate-bad" id="teacherGateBad" hidden>That password is not right.</p>
+    </form>
+    <div class="sheet">${rows}</div>`;
+}
+
+function prepareUnitFlow(bookId, unit) {
+  const targets = speakTargets(bookId, unit);
+  const ids = targets.map((target) => target.id);
+  const wordCount = sumWords(targets.map((target) => target.english));
+  let flow = reconcileFlow(loadUnitFlow(bookId, unit.id), Date.now());
+  if (flow.phase === 'part1' || flow.phase === 'teacher') {
+    flow = advanceFlow(flow, ids, wordCount);
+  }
+  if (flow.phase === 'part2' && !flow.part2.wordCount) {
+    flow = Object.assign({}, flow, {
+      part2: Object.assign({}, flow.part2, { wordCount, limitSec: timerSeconds(wordCount) }),
+    });
+  }
+  saveUnitFlow(bookId, unit.id, flow);
+  return { targets, flow, wordCount };
+}
+
+function renderSheet(bookId, unitId) {
+  const book = byId.get(bookId);
+  const unit = book && book.units.find((u) => u.id === unitId);
+  if (!unit) { appEl.innerHTML = '<p class="lead">That unit is not here.</p>'; return; }
+  const prepared = prepareUnitFlow(bookId, unit);
+  const flow = prepared.flow;
+  const targets = prepared.targets;
+  const ready = !!checkerReady;
+  const scores = flow.attempts || {};
+  const wait = modelError
+    ? `<p class="note">${escapeHtml(modelError)}</p>`
+    : (ready ? '' : '<p class="note">Whistle is still loading. Mic turns on when the bar finishes.</p>');
+  const beside = questionCue(unit.title);
+  const besideHtml = beside && beside !== unit.title ? `<span class="l1-beside">${escapeHtml(beside)}</span>` : '';
+  const back = `<a class="back" href="#/book/${book.id}">← ${escapeHtml(book.label)}</a><h1>${escapeHtml(unit.title)}${besideHtml}</h1>${wait}`;
+  if (flow.phase === 'teacher') {
+    appEl.innerHTML = `${back}<div class="phase" data-phase="teacher">${teacherBlockHtml(targets, ready, flow)}</div>`;
+    syncClock(null);
+    return;
+  }
+  const view = sheetView(flow, targets);
+  const shared = renderSharedQuestion(bookId, unit, scores, ready, view);
+  const lines = sheetLines(bookId, unit);
+  const rows = lines.map((line, index) => lineArticleHtml(line, unit, index, scores, ready, view)).join('');
+  const rush = flow.phase === 'part2' || flow.phase === 'results' ? rushBarHtml(flow) : '';
+  const results = flow.phase === 'results' ? resultsHtml(flow, targets) : '';
+  appEl.innerHTML = `${back}${rush}${results}<div class="sheet phase" data-phase="${escapeHtml(flow.phase)}">${shared}${rows}</div>`;
+  syncClock(flow.phase === 'part2' ? flow : null);
+}
+
+function syncClock(flow) {
+  if (clockTimer) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
+  if (!flow || !timerRunning(flow)) return;
+  clockTimer = setInterval(() => {
+    const r = route();
+    if (r.name !== 'sheet') return;
+    const live = loadUnitFlow(r.bookId, r.unitId);
+    if (!timerRunning(live)) {
+      chain(() => endPart2(r.bookId, r.unitId));
+      return;
+    }
+    const el = document.getElementById('rushClock');
+    if (el) el.textContent = String(clockSeconds(live, Date.now()));
+  }, 200);
+}
+
+function render() {
+  if (!books.length) {
+    appEl.innerHTML = '<p class="lead">Loading the sheets…</p>';
+    return;
+  }
+  const r = route();
+  if (r.name === 'units') renderUnits(r.bookId);
+  else if (r.name === 'sheet') renderSheet(r.bookId, r.unitId);
+  else renderHome();
+}
+
+function findItem(id) {
+  for (const book of books) {
+    for (const unit of book.units) {
+      const item = unit.items.find((it) => it.id === id);
+      if (item) return { item, unit, book };
+    }
+  }
+  return null;
+}
+
+function encodeWav(floatChunks, sampleRate) {
+  let len = 0;
+  for (const c of floatChunks) len += c.length;
+  const samples = new Float32Array(len);
+  let o = 0;
+  for (const c of floatChunks) { samples.set(c, o); o += c.length; }
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const wstr = (s, p) => { for (let i = 0; i < s.length; i++) v.setUint8(p + i, s.charCodeAt(i)); };
+  wstr('RIFF', 0); v.setUint32(4, 36 + samples.length * 2, true);
+  wstr('WAVE', 8); wstr('fmt ', 12);
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wstr('data', 36); v.setUint32(40, samples.length * 2, true);
+  let p = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(p, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    p += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function disconnectSilenceNodes() {
+  if (!silenceNodes) return;
+  try { silenceNodes.src.disconnect(); } catch (_) {}
+  try { silenceNodes.analyser.disconnect(); } catch (_) {}
+  try { if (silenceNodes.sink) silenceNodes.sink.disconnect(); } catch (_) {}
+  silenceNodes = null;
+}
+
+function stopSilenceWatch() {
+  if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+  disconnectSilenceNodes();
+}
+
+function startSilenceWatch(stream, ctx, onDone) {
+  stopSilenceWatch();
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    stopSilenceWatch();
+    try { onDone(); } catch (e) { console.warn('silence onDone', e); }
+  };
+  try {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.4;
+    src.connect(analyser);
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    analyser.connect(sink);
+    sink.connect(ctx.destination);
+    silenceNodes = { src, analyser, sink };
+    const buf = new Uint8Array(analyser.fftSize);
+    let quietMs = 0;
+    let totalMs = 0;
+    let spoke = false;
+    const tick = () => {
+      if (finished) return;
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      analyser.getByteTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / buf.length);
+      totalMs += SILENCE_CHECK_MS;
+      if (rms >= SILENCE_RMS) {
+        spoke = true;
+        quietMs = 0;
+      } else if (totalMs > SILENCE_GRACE_MS && spoke) {
+        quietMs += SILENCE_CHECK_MS;
+      }
+      if (quietMs >= SILENCE_MS || totalMs >= MAX_RECORD_MS || (!spoke && totalMs >= 12000)) {
+        finish();
+        return;
+      }
+      silenceTimer = setTimeout(tick, SILENCE_CHECK_MS);
+    };
+    silenceTimer = setTimeout(tick, SILENCE_CHECK_MS);
+  } catch (e) {
+    console.warn('startSilenceWatch failed', e);
+    silenceTimer = setTimeout(finish, 5000);
+  }
+}
+
+function startCapture(stream) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  const src = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  const chunks = [];
+  proc.onaudioprocess = (e) => {
+    if (!capture) return;
+    chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  };
+  src.connect(proc);
+  proc.connect(gain);
+  gain.connect(ctx.destination);
+  return { ctx, src, proc, gain, chunks, stream };
+}
+
+function claimCapture() {
+  const rec = capture;
+  capture = null;
+  stopSilenceWatch();
+  if (!rec) return null;
+  try { rec.proc.disconnect(); rec.src.disconnect(); rec.gain.disconnect(); } catch (_) {}
+  rec.stream.getTracks().forEach((t) => t.stop());
+  return rec;
+}
+
+async function blobFrom(rec) {
+  if (!rec) return null;
+  const rate = rec.ctx.sampleRate || 48000;
+  const blob = encodeWav(rec.chunks, rate);
+  rec.ctx.close().catch(() => {});
+  return blob;
+}
+
+async function stopCapture() {
+  const rec = claimCapture();
+  return blobFrom(rec);
+}
+
+function stillOnSheet(bookId, unitId) {
+  const r = route();
+  return r.name === 'sheet' && r.bookId === bookId && r.unitId === unitId;
+}
+
+function studentRecord(graded, gradeText, reason) {
+  return {
+    score: graded ? graded.score : 0,
+    scorePct: graded ? graded.scorePct : 0,
+    pass: graded ? !!graded.pass : false,
+    weak: graded ? graded.weak : [],
+    reason: graded ? graded.reason : reason,
+    english: graded ? graded.english : scoringTarget(gradeText),
+    words: graded ? graded.words : [],
+    heard: graded ? graded.heard : '',
+    at: Date.now(),
+  };
+}
+
+async function gradeRush(meta, blob) {
+  rushInFlight += 1;
+  try {
+    const graded = await gradeBlob(blob, meta.gradeText);
+    const flow = noteRushGrade(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, graded);
+    saveUnitFlow(meta.bookId, meta.unitId, flow);
+  } catch (err) {
+    const flow = noteRushGrade(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, { pass: false, scorePct: 0 });
+    saveUnitFlow(meta.bookId, meta.unitId, flow);
+    console.error(err);
+  } finally {
+    rushInFlight -= 1;
+  }
+}
+
+async function gradeStudentOrTeacher(meta, blob) {
+  part1Busy = true;
+  gradingScoreKey = meta.scoreKey;
+  if (stillOnSheet(meta.bookId, meta.unitId)) render();
+  let graded = null;
+  let thrown = null;
+  try {
+    graded = await gradeBlob(blob, meta.gradeText);
+  } catch (err) {
+    thrown = err;
+    console.error(err);
+  }
+  if (meta.phase === 'teacher') {
+    if (graded && graded.pass) {
+      delete teacherMiss[meta.scoreKey];
+      let flow = noteTeacherPass(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey);
+      flow = advanceFlow(flow, meta.ids, meta.wordCount);
+      saveUnitFlow(meta.bookId, meta.unitId, flow);
+    } else {
+      teacherMiss[meta.scoreKey] = true;
+    }
+  } else {
+    const failReason = thrown && thrown.code === 'too_short'
+      ? 'Too short. Say the whole English line.'
+      : 'Could not check that try. Say it again.';
+    const record = thrown ? studentRecord(null, meta.gradeText, failReason) : studentRecord(graded, meta.gradeText);
+    let flow = noteAttempt(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, record);
+    flow = advanceFlow(flow, meta.ids, meta.wordCount);
+    saveUnitFlow(meta.bookId, meta.unitId, flow);
+    const scores = loadScores();
+    scores[meta.scoreKey] = record;
+    saveScores(scores);
+    if (meta.itemId) {
+      noteScoreToAuth(meta.itemId, record.scorePct);
+      logToOneBook(meta.itemId, record);
+    }
+    if (stillOnSheet(meta.bookId, meta.unitId)) {
+      const gradeText = meta.gradeText;
+      const audioRel = meta.audioRel;
+      if (thrown) await playExpectedOnFail(gradeText, audioRel, false);
+      else await playExpectedOnFail(gradeText, audioRel, graded.pass);
+    }
+  }
+  part1Busy = false;
+  gradingScoreKey = null;
+  if (stillOnSheet(meta.bookId, meta.unitId)) render();
+}
+
+async function finishTake() {
+  const meta = claimCapture();
+  if (!meta || !meta.scoreKey || !meta.gradeText) return;
+  if (meta.phase === 'part2') {
+    const flow = markRushRecorded(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey);
+    saveUnitFlow(meta.bookId, meta.unitId, flow);
+    if (stillOnSheet(meta.bookId, meta.unitId)) render();
+    const blob = await blobFrom(meta);
+    if (blob) void gradeRush(meta, blob);
+    return;
+  }
+  part1Busy = true;
+  gradingScoreKey = meta.scoreKey;
+  if (stillOnSheet(meta.bookId, meta.unitId)) render();
+  const blob = await blobFrom(meta);
+  if (!blob) {
+    part1Busy = false;
+    gradingScoreKey = null;
+    if (stillOnSheet(meta.bookId, meta.unitId)) render();
+    return;
+  }
+  await gradeStudentOrTeacher(meta, blob);
+}
+
+async function endPart2(bookId, unitId) {
+  const cur = loadUnitFlow(bookId, unitId);
+  if (cur.phase !== 'part2' || !cur.part2.startedAt || cur.part2.stoppedAt) return;
+  const meta = claimCapture();
+  let flow = loadUnitFlow(bookId, unitId);
+  if (meta && meta.scoreKey) flow = markRushRecorded(flow, meta.scoreKey);
+  flow = stopTimer(flow, Date.now());
+  saveUnitFlow(bookId, unitId, flow);
+  if (stillOnSheet(bookId, unitId)) render();
+  const blob = meta ? await blobFrom(meta) : null;
+  if (meta && blob) void gradeRush(meta, blob);
+}
+
+async function gradeBlob(blob, english) {
+  const target = scoringTarget(english);
+  if (!whistleModule) throw new Error('Whistle is not ready');
+  const samples = await decodeAudioToMono(blob, 16000);
+  const stats = audioStats(samples, 16000);
+  if (stats.durationMs < 80) {
+    const err = new Error('too_short');
+    err.code = 'too_short';
+    throw err;
+  }
+  const trimmed = capSpeechWindow(trimSilence(samples, 16000, 0.006, 80), 16000, SPEECH_CAP_MS);
+  const heard = transcribePcm(whistleModule, trimmed, target);
+  const judged = judgeTranscript(target, heard);
+  let reason = '';
+  if (!judged.pass) {
+    reason = judged.heard ? 'Some words did not match.' : 'No words heard. Say the line again.';
+  }
+  return {
+    score: judged.score,
+    scorePct: judged.scorePct,
+    pass: judged.pass,
+    weak: judged.weak,
+    reason,
+    english: target,
+    words: judged.words,
+    heard: judged.heard,
+  };
+}
+
+function noteScoreToAuth(itemId, scorePct) {
+  const auth = window.MRJ_AUTH;
+  if (!auth || typeof auth.noteScore !== 'function' || typeof auth.student !== 'function') return;
+  const student = auth.student();
+  if (!student || !student.id) return;
+  auth.noteScore({
+    program: 'pronounce',
+    itemId: 'whistle:' + itemId,
+    scoreValue: Math.round(scorePct),
+    scoreMax: 100,
+    scorePct: Math.round(scorePct),
+  });
+}
+
+function playAudioUrl(url, times = 1) {
+  return new Promise((resolve) => {
+    let left = times;
+    const playOnce = () => {
+      if (left <= 0) { resolve(); return; }
+      left -= 1;
+      const audio = new Audio(url);
+      audio.addEventListener('ended', () => playOnce());
+      audio.addEventListener('error', () => playOnce());
+      audio.play().catch(() => playOnce());
+    };
+    playOnce();
+  });
+}
+
+async function playExpectedOnFail(gradeText, audioRel, pass) {
+  if (pass || !audioRel) return;
+  const url = hearSrc(audioRel);
+  const plays = needsTripleHint(gradeText) ? 3 : 1;
+  await playAudioUrl(url, plays);
+}
+
+let armingMic = false;
+
+async function onMic(btn) {
+  if (armingMic || capture) return;
+  const r = route();
+  if (r.name !== 'sheet') return;
+  const book = byId.get(r.bookId);
+  const unit = book && book.units.find((u) => u.id === r.unitId);
+  if (!unit) return;
+  const flow = loadUnitFlow(r.bookId, r.unitId);
+  const scoreKey = btn.getAttribute('data-score-key');
+  const gradeText = btn.getAttribute('data-grade-text');
+  const audioRel = btn.getAttribute('data-audio-rel');
+  const itemId = btn.getAttribute('data-item-id');
+  if (!scoreKey || !gradeText || !checkerReady) return;
+  if (!canStartMic({
+    phase: flow.phase,
+    recording: !!capture || armingMic,
+    grading: part1Busy || rushInFlight > 0,
+    timerRunning: timerRunning(flow),
+    lineOpen: lineOpenFor(flow, scoreKey),
+  })) return;
+  armingMic = true;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (err) {
+    armingMic = false;
+    modelLabel.classList.remove('done');
+    modelLabel.textContent = 'The microphone is blocked. Allow the mic and tap again.';
+    console.error(err);
+    return;
+  }
+  if (capture || !canStartMic({
+    phase: flow.phase,
+    recording: false,
+    grading: part1Busy || rushInFlight > 0,
+    timerRunning: timerRunning(loadUnitFlow(r.bookId, r.unitId)),
+    lineOpen: lineOpenFor(loadUnitFlow(r.bookId, r.unitId), scoreKey),
+  })) {
+    stream.getTracks().forEach((t) => t.stop());
+    armingMic = false;
+    return;
+  }
+  const targets = speakTargets(r.bookId, unit);
+  capture = startCapture(stream);
+  capture.scoreKey = scoreKey;
+  capture.gradeText = gradeText;
+  capture.audioRel = audioRel;
+  capture.itemId = itemId || scoreKey;
+  capture.phase = flow.phase;
+  capture.bookId = r.bookId;
+  capture.unitId = r.unitId;
+  capture.ids = targets.map((target) => target.id);
+  capture.wordCount = sumWords(targets.map((target) => target.english));
+  armingMic = false;
+  startSilenceWatch(stream, capture.ctx, () => {
+    chain(() => finishTake());
+  });
+  appEl.querySelectorAll('.mic').forEach((el) => {
+    el.disabled = el !== btn;
+    if (el === btn) { el.textContent = 'Listening…'; el.classList.add('live'); }
+  });
+}
+
+function onRushStart() {
+  const r = route();
+  if (r.name !== 'sheet' || !checkerReady || capture || part1Busy) return;
+  const flow = startTimer(loadUnitFlow(r.bookId, r.unitId), Date.now());
+  saveUnitFlow(r.bookId, r.unitId, flow);
+  render();
+}
+
+function onTeacherGate(ev) {
+  ev.preventDefault();
+  const r = route();
+  if (r.name !== 'sheet') return;
+  const book = byId.get(r.bookId);
+  const unit = book && book.units.find((u) => u.id === r.unitId);
+  if (!unit) return;
+  const input = document.getElementById('teacherPassword');
+  const text = input ? input.value : '';
+  const targets = speakTargets(r.bookId, unit);
+  const result = tryTeacherPassword(
+    loadUnitFlow(r.bookId, r.unitId),
+    targets.map((target) => target.id),
+    sumWords(targets.map((target) => target.english)),
+    text,
+  );
+  if (!result.ok) {
+    const bad = document.getElementById('teacherGateBad');
+    if (bad) bad.hidden = false;
+    return;
+  }
+  saveUnitFlow(r.bookId, r.unitId, result.flow);
+  render();
+}
+
+function onHear(btn) {
+  const rel = btn.getAttribute('data-audio');
+  if (!rel) return;
+  const audio = new Audio(hearSrc(rel));
+  audio.play().catch((err) => console.error(err));
+}
+
+if (appEl) {
+  appEl.addEventListener('click', (ev) => {
+    const hear = ev.target.closest('.hear');
+    if (hear) { onHear(hear); return; }
+    if (ev.target.closest('#rushStart')) { onRushStart(); return; }
+    if (ev.target.closest('#rushStop')) {
+      const r = route();
+      if (r.name === 'sheet') chain(() => endPart2(r.bookId, r.unitId));
+      return;
+    }
+    const mic = ev.target.closest('.mic');
+    if (mic) onMic(mic);
+  });
+
+  appEl.addEventListener('submit', (ev) => {
+    if (ev.target.closest('#teacherGate')) onTeacherGate(ev);
+  });
+
+  window.addEventListener('hashchange', () => {
+    chain(async () => {
+      const rec = claimCapture();
+      if (rec) rec.ctx.close().catch(() => {});
+      part1Busy = false;
+      gradingScoreKey = null;
+      render();
+    });
+  });
+
+  fillLangMenu();
+  applyLangDir();
+  const langMenu = document.getElementById('langMenu');
+  if (langMenu) {
+    langMenu.addEventListener('change', () => {
+      localStorage.setItem(LANG_KEY, langMenu.value);
+      applyLangDir();
+      render();
+    });
+  }
+
+  loadContent().then(async () => {
+    try {
+      const response = await fetch('content/l1.json?v=20260930-l1');
+      if (response.ok) l1Pack = await response.json();
+    } catch (err) {
+      console.error(err);
+    }
+    render();
+  }).catch((err) => {
+    appEl.innerHTML = '<p class="lead">Could not load the sheets.</p>';
+    console.error(err);
+  });
+  bootModel();
+}
+
+export {
+  QUESTION_CODES,
+  analyzeUnit,
+  scoringTarget,
+  rowParts,
+  lineParts,
+  lineArticleHtml,
+  renderSharedQuestion,
+  scoreStorageKey,
+  sharedScoreKey,
+  itaQuestion,
+  cipoAnswer,
+  itemRowPassed,
+  speakTargets,
+  speakWordCount,
+};
