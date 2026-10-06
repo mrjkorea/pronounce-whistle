@@ -1,5 +1,5 @@
 import { decodeAudioToMono, audioStats, trimSilence, capSpeechWindow } from './audio.js';
-import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261004-whistle';
+import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-easy';
 import { sheetLines } from './sheet.js';
 import {
   FLOW_STORAGE_KEY,
@@ -28,7 +28,7 @@ const LOCAL_HEAR = new Set([
   'audio/hear/it-is-here.mp3',
   'audio/hear/it-is-there.mp3',
 ]);
-const SPEECH_CAP_MS = 12000;
+const SPEECH_CAP_MS = 30000;
 const SCORE_KEY = 'day4-pronounce-scores-v2';
 const LANG_KEY = 'day4-ui-lang';
 const UI_LANGS = [
@@ -271,7 +271,6 @@ function setProgress(frac, text) {
 }
 
 function markModelReady() {
-  modelLabel.classList.add('done');
   modelTrack.classList.add('done');
 }
 
@@ -282,7 +281,7 @@ async function bootModel() {
       setProgress(0.05 + frac * 0.9, 'Loading Whistle… ' + Math.round(frac * 100) + '%');
     });
     checkerReady = true;
-    setProgress(1, 'Whistle 16.9 MB');
+    setProgress(1, 'Easy. Words only. Pass at 70 percent in order, or 50 percent of the same words.');
     markModelReady();
     render();
   } catch (err) {
@@ -439,10 +438,13 @@ function englishCueHtml(english, className, saved) {
 
 function partResultHtml(saved) {
   if (!saved) return '';
-  const pct = saved.scorePct != null ? saved.scorePct : Math.round((saved.score || 0) * 100);
+  const fallback = saved.scorePct != null ? saved.scorePct : Math.round((saved.score || 0) * 100);
+  const orderPct = saved.orderPct != null ? saved.orderPct : fallback;
+  const samePct = saved.samePct != null ? saved.samePct : fallback;
+  const counts = `<p class="meta">In order: ${orderPct}. Same words: ${samePct}.</p>`;
   const verdict = saved.pass
-    ? `<p class="verdict pass">PASS</p><p class="meta">${pct}</p>`
-    : `<p class="verdict fail">Not yet · ${pct}</p>`;
+    ? `<p class="verdict pass">PASS</p>${counts}`
+    : `<p class="verdict fail">Not yet</p>${counts}`;
   const reason = saved.reason ? `<p class="meta">${escapeHtml(saved.reason)}</p>` : '';
   const chips = wordChipsHtml(saved.words);
   return `<div class="after show">
@@ -985,6 +987,8 @@ function studentRecord(graded, gradeText, reason) {
   return {
     score: graded ? graded.score : 0,
     scorePct: graded ? graded.scorePct : 0,
+    orderPct: graded && graded.orderPct != null ? graded.orderPct : 0,
+    samePct: graded && graded.samePct != null ? graded.samePct : 0,
     pass: graded ? !!graded.pass : false,
     weak: graded ? graded.weak : [],
     reason: graded ? graded.reason : reason,
@@ -1130,8 +1134,10 @@ async function gradeBlob(blob, english) {
     reason = judged.heard ? 'Some words did not match.' : 'No words heard. Say the line again.';
   }
   return {
-    score: judged.score,
+    score: judged.scorePct / 100,
     scorePct: judged.scorePct,
+    orderPct: judged.orderPct,
+    samePct: judged.samePct,
     pass: judged.pass,
     weak: judged.weak,
     reason,

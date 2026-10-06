@@ -23,3 +23,11 @@ The clip `audio/hear/it-is-here.mp3` transcribed as `It is here.`
 Phonon-2 is not in this folder. That model has no browser engine.
 
 After a saved try, the full English sentence shows on pass and fail, each word green or red, with large PASS or "Not yet", the heard text under the sentence, and word chips on every saved result.
+
+## Easy word match — 7 Oct 2026
+
+Model: grok-4.7
+
+Files: `src/whistle.js`, `src/app.js`, `index.html`, `test/judge-easy.test.mjs`
+
+`node --test test/judge-easy.test.mjs` exited 0. 6 passed, 0 failed.

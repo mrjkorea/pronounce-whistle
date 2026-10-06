@@ -18,17 +18,30 @@ function judgeTranscript(targetText, heardText) {
     .map((word) => ({ word, key: wordKey(word) }))
     .filter((item) => item.key);
   const heard = wordsOf(heardText).map(wordKey).filter(Boolean);
-  let matched = 0;
+  const pool = heard.slice();
+  let orderHits = 0;
+  let sameHits = 0;
   const words = target.map((item, index) => {
-    const match = heard[index] === item.key;
-    if (match) matched += 1;
-    return { word: item.word, score: match ? 1 : 0, match };
+    const orderMatch = heard[index] === item.key;
+    if (orderMatch) orderHits += 1;
+    const poolIndex = pool.indexOf(item.key);
+    const match = poolIndex !== -1;
+    if (match) {
+      pool.splice(poolIndex, 1);
+      sameHits += 1;
+    }
+    return { word: item.word, score: match ? 1 : 0, match, orderMatch };
   });
-  const score = target.length ? matched / target.length : 0;
+  const count = target.length;
+  const orderPct = count ? Math.round((orderHits / count) * 100) : 0;
+  const samePct = count ? Math.round((sameHits / count) * 100) : 0;
+  const scorePct = Math.max(orderPct, samePct);
+  const pass = count > 0 && heard.length > 0 && (orderPct >= 70 || samePct >= 50);
   return {
-    score,
-    scorePct: Math.round(score * 100),
-    pass: target.length > 0 && matched === target.length,
+    orderPct,
+    samePct,
+    scorePct,
+    pass,
     words,
     weak: words.filter((item) => !item.match).map((item) => item.word),
     heard: String(heardText || ''),
