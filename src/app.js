@@ -21,7 +21,7 @@ import {
   timerRunning,
   timerSeconds,
   tryTeacherPassword,
-} from './flow.js';
+} from './flow.js?v=20261006-stop2';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
@@ -70,7 +70,7 @@ const QUESTION_CODES = {
 const SILENCE_MS = 1200;
 const SILENCE_GRACE_MS = 1600;
 const SILENCE_CHECK_MS = 80;
-const SILENCE_RMS = 0.008;
+const SILENCE_RMS = 0.08;
 const MAX_RECORD_MS = 60000;
 
 const appEl = typeof document !== 'undefined' ? document.getElementById('app') : null;
@@ -84,12 +84,13 @@ let whistleModule = null;
 let checkerReady = false;
 let modelError = '';
 let capture = null;
+let nextTakeId = 1;
 let silenceTimer = null;
 let silenceNodes = null;
 let gradingScoreKey = null;
-let part1Busy = false;
-let rushInFlight = 0;
+let gradeSerial = 0;
 let chainTail = Promise.resolve();
+let scoreTail = Promise.resolve();
 let clockTimer = null;
 let teacherMiss = {};
 
@@ -254,6 +255,12 @@ function saveUnitFlow(bookId, unitId, flow) {
 function chain(fn) {
   const next = chainTail.then(fn, fn);
   chainTail = next.then(() => {}, () => {});
+  return next;
+}
+
+function queueScore(fn) {
+  const next = scoreTail.then(fn, fn);
+  scoreTail = next.then(() => {}, () => {});
   return next;
 }
 
@@ -637,8 +644,7 @@ function sheetView(flow, targets) {
     const id = targets[i].id;
     allow[id] = checkerReady && canStartMic({
       phase: flow.phase,
-      recording: !!capture,
-      grading: part1Busy || rushInFlight > 0,
+      recording: false,
       timerRunning: running,
       lineOpen: lineOpenFor(flow, id),
     });
@@ -715,8 +721,7 @@ function teacherBlockHtml(targets, ready, flow) {
     const miss = teacherMiss[target.id] ? '<p class="verdict fail">Not yet</p>' : '';
     const allowed = checkerReady && canStartMic({
       phase: 'teacher',
-      recording: !!capture,
-      grading: part1Busy || rushInFlight > 0,
+      recording: false,
       timerRunning: false,
       lineOpen: true,
     });
@@ -772,6 +777,7 @@ function renderSheet(bookId, unitId) {
   if (flow.phase === 'teacher') {
     appEl.innerHTML = `${back}<div class="phase" data-phase="teacher">${teacherBlockHtml(targets, ready, flow)}</div>`;
     syncClock(null);
+    markLiveMic();
     return;
   }
   const view = sheetView(flow, targets);
@@ -782,6 +788,19 @@ function renderSheet(bookId, unitId) {
   const results = flow.phase === 'results' ? resultsHtml(flow, targets) : '';
   appEl.innerHTML = `${back}${rush}${results}<div class="sheet phase" data-phase="${escapeHtml(flow.phase)}">${shared}${rows}</div>`;
   syncClock(flow.phase === 'part2' ? flow : null);
+  markLiveMic();
+}
+
+function markLiveMic() {
+  if (!appEl || !capture) return;
+  const key = capture.scoreKey;
+  appEl.querySelectorAll('.mic').forEach((el) => {
+    if (el.getAttribute('data-score-key') !== key) return;
+    el.disabled = false;
+    el.textContent = 'Stop';
+    el.classList.add('live');
+    el.setAttribute('aria-label', 'Stop');
+  });
 }
 
 function syncClock(flow) {
@@ -977,7 +996,6 @@ function studentRecord(graded, gradeText, reason) {
 }
 
 async function gradeRush(meta, blob) {
-  rushInFlight += 1;
   try {
     const graded = await gradeBlob(blob, meta.gradeText);
     const flow = noteRushGrade(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, graded);
@@ -986,15 +1004,23 @@ async function gradeRush(meta, blob) {
     const flow = noteRushGrade(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, { pass: false, scorePct: 0 });
     saveUnitFlow(meta.bookId, meta.unitId, flow);
     console.error(err);
-  } finally {
-    rushInFlight -= 1;
   }
 }
 
-async function gradeStudentOrTeacher(meta, blob) {
-  part1Busy = true;
+function showGradeBar(meta, serial) {
+  if (serial !== gradeSerial) return;
   gradingScoreKey = meta.scoreKey;
   if (stillOnSheet(meta.bookId, meta.unitId)) render();
+}
+
+function releaseGradeBar(meta, serial) {
+  if (serial !== gradeSerial) return;
+  if (gradingScoreKey === meta.scoreKey) gradingScoreKey = null;
+  if (stillOnSheet(meta.bookId, meta.unitId)) render();
+}
+
+async function gradeStudentOrTeacher(meta, blob, serial) {
+  showGradeBar(meta, serial);
   let graded = null;
   let thrown = null;
   try {
@@ -1034,33 +1060,44 @@ async function gradeStudentOrTeacher(meta, blob) {
       else await playExpectedOnFail(gradeText, audioRel, graded.pass);
     }
   }
-  part1Busy = false;
-  gradingScoreKey = null;
-  if (stillOnSheet(meta.bookId, meta.unitId)) render();
+  releaseGradeBar(meta, serial);
 }
 
-async function finishTake() {
+function queueBlobScore(meta, serial) {
+  queueScore(async () => {
+    let blob = null;
+    try {
+      blob = await blobFrom(meta);
+    } catch (err) {
+      console.error(err);
+    }
+    if (!blob) {
+      if (serial != null) releaseGradeBar(meta, serial);
+      return;
+    }
+    if (meta.phase === 'part2') {
+      await gradeRush(meta, blob);
+      return;
+    }
+    await gradeStudentOrTeacher(meta, blob, serial);
+  });
+}
+
+function finishTake(expectedId) {
+  if (expectedId != null && (!capture || capture.takeId !== expectedId)) return;
   const meta = claimCapture();
   if (!meta || !meta.scoreKey || !meta.gradeText) return;
   if (meta.phase === 'part2') {
     const flow = markRushRecorded(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey);
     saveUnitFlow(meta.bookId, meta.unitId, flow);
     if (stillOnSheet(meta.bookId, meta.unitId)) render();
-    const blob = await blobFrom(meta);
-    if (blob) void gradeRush(meta, blob);
+    queueBlobScore(meta, null);
     return;
   }
-  part1Busy = true;
+  const serial = ++gradeSerial;
   gradingScoreKey = meta.scoreKey;
   if (stillOnSheet(meta.bookId, meta.unitId)) render();
-  const blob = await blobFrom(meta);
-  if (!blob) {
-    part1Busy = false;
-    gradingScoreKey = null;
-    if (stillOnSheet(meta.bookId, meta.unitId)) render();
-    return;
-  }
-  await gradeStudentOrTeacher(meta, blob);
+  queueBlobScore(meta, serial);
 }
 
 async function endPart2(bookId, unitId) {
@@ -1072,8 +1109,7 @@ async function endPart2(bookId, unitId) {
   flow = stopTimer(flow, Date.now());
   saveUnitFlow(bookId, unitId, flow);
   if (stillOnSheet(bookId, unitId)) render();
-  const blob = meta ? await blobFrom(meta) : null;
-  if (meta && blob) void gradeRush(meta, blob);
+  if (meta && meta.scoreKey && meta.gradeText) queueBlobScore(meta, null);
 }
 
 async function gradeBlob(blob, english) {
@@ -1144,22 +1180,27 @@ async function playExpectedOnFail(gradeText, audioRel, pass) {
 let armingMic = false;
 
 async function onMic(btn) {
-  if (armingMic || capture) return;
+  if (armingMic) return;
   const r = route();
   if (r.name !== 'sheet') return;
   const book = byId.get(r.bookId);
   const unit = book && book.units.find((u) => u.id === r.unitId);
   if (!unit) return;
-  const flow = loadUnitFlow(r.bookId, r.unitId);
   const scoreKey = btn.getAttribute('data-score-key');
   const gradeText = btn.getAttribute('data-grade-text');
   const audioRel = btn.getAttribute('data-audio-rel');
   const itemId = btn.getAttribute('data-item-id');
   if (!scoreKey || !gradeText || !checkerReady) return;
+  if (capture && scoreKey === capture.scoreKey) {
+    finishTake(capture.takeId);
+    return;
+  }
+  if (btn.classList.contains('live')) return;
+  if (capture) finishTake(capture.takeId);
+  const flow = loadUnitFlow(r.bookId, r.unitId);
   if (!canStartMic({
     phase: flow.phase,
     recording: !!capture || armingMic,
-    grading: part1Busy || rushInFlight > 0,
     timerRunning: timerRunning(flow),
     lineOpen: lineOpenFor(flow, scoreKey),
   })) return;
@@ -1176,12 +1217,12 @@ async function onMic(btn) {
     console.error(err);
     return;
   }
+  const latest = loadUnitFlow(r.bookId, r.unitId);
   if (capture || !canStartMic({
-    phase: flow.phase,
-    recording: false,
-    grading: part1Busy || rushInFlight > 0,
-    timerRunning: timerRunning(loadUnitFlow(r.bookId, r.unitId)),
-    lineOpen: lineOpenFor(loadUnitFlow(r.bookId, r.unitId), scoreKey),
+    phase: latest.phase,
+    recording: !!capture,
+    timerRunning: timerRunning(latest),
+    lineOpen: lineOpenFor(latest, scoreKey),
   })) {
     stream.getTracks().forEach((t) => t.stop());
     armingMic = false;
@@ -1189,28 +1230,27 @@ async function onMic(btn) {
   }
   const targets = speakTargets(r.bookId, unit);
   capture = startCapture(stream);
+  capture.takeId = nextTakeId++;
   capture.scoreKey = scoreKey;
   capture.gradeText = gradeText;
   capture.audioRel = audioRel;
   capture.itemId = itemId || scoreKey;
-  capture.phase = flow.phase;
+  capture.phase = latest.phase;
   capture.bookId = r.bookId;
   capture.unitId = r.unitId;
   capture.ids = targets.map((target) => target.id);
   capture.wordCount = sumWords(targets.map((target) => target.english));
+  const takeId = capture.takeId;
   armingMic = false;
   startSilenceWatch(stream, capture.ctx, () => {
-    chain(() => finishTake());
+    finishTake(takeId);
   });
-  appEl.querySelectorAll('.mic').forEach((el) => {
-    el.disabled = el !== btn;
-    if (el === btn) { el.textContent = 'Listening…'; el.classList.add('live'); }
-  });
+  markLiveMic();
 }
 
 function onRushStart() {
   const r = route();
-  if (r.name !== 'sheet' || !checkerReady || capture || part1Busy) return;
+  if (r.name !== 'sheet' || !checkerReady || capture) return;
   const flow = startTimer(loadUnitFlow(r.bookId, r.unitId), Date.now());
   saveUnitFlow(r.bookId, r.unitId, flow);
   render();
@@ -1270,7 +1310,6 @@ if (appEl) {
     chain(async () => {
       const rec = claimCapture();
       if (rec) rec.ctx.close().catch(() => {});
-      part1Busy = false;
       gradingScoreKey = null;
       render();
     });
