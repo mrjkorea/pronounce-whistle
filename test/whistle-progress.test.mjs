@@ -12,9 +12,13 @@ import {
   parseProgressScore,
   resolveStudentId,
   scoresFromProgressRows,
+  readJsonStorage,
   serializeProgressPack,
   storageKeyForStudent,
 } from '../src/whistle-progress.js';
+
+const LEGACY_SCORE_KEY = 'day4-pronounce-scores-v2';
+const LEGACY_FLOW_KEY = 'day4-pronounce-two-parts-v1';
 
 test('resolveStudentId accepts string or object student()', () => {
   assert.equal(resolveStudentId({ student: () => 'Jay' }), 'Jay');
@@ -59,6 +63,49 @@ test('pack save is gated until loadPack succeeds', () => {
   assert.equal(packSaveAllowed({ packLoaded: false, packLoadOk: false, packLoadFailed: true }), false);
 });
 
+test('device-wide legacy localStorage is never merged or sent in savePack', async () => {
+  const legacyScores = { 'other-student-line': { scorePct: 99, pass: true, at: 1 } };
+  const legacyFlows = { 'basic_a/unit1': { phase: 'part2', fails: {}, student: {}, attempts: {} } };
+  const saves = [];
+  const storage = {
+    data: {
+      [LEGACY_SCORE_KEY]: JSON.stringify(legacyScores),
+      [LEGACY_FLOW_KEY]: JSON.stringify(legacyFlows),
+    },
+    getItem(key) { return this.data[key] || null; },
+    setItem(key, value) { this.data[key] = value; },
+  };
+  const sync = createPackSync({
+    storage,
+    window: { addEventListener() {} },
+    document: { visibilityState: 'visible' },
+    getAuth: () => ({
+      student: () => 'Alice',
+      progressError: () => '',
+      loadProgressForApp: async () => ({ ok: true, progress: [] }),
+      loadPack: async () => ({ ok: true, found: false, progress_json: '{}' }),
+      savePack: async (program, json) => {
+        saves.push({ program, json });
+        return { ok: true };
+      },
+      packReady: (program) => program === PACK_PROGRAM,
+    }),
+    setActiveStudent() {},
+    scoreStorageKey: () => storageKeyForStudent(LEGACY_SCORE_KEY, 'Alice'),
+    flowStorageKey: () => storageKeyForStudent(LEGACY_FLOW_KEY, 'Alice'),
+  });
+
+  await sync.onAuthReady({ progress: [] });
+  assert.deepEqual(readJsonStorage(storage, LEGACY_SCORE_KEY), legacyScores);
+  assert.deepEqual(readJsonStorage(storage, LEGACY_FLOW_KEY), legacyFlows);
+  sync.markDirty();
+  await sync.flushSave(true);
+  assert.equal(saves.length, 1);
+  const body = JSON.parse(saves[0].json);
+  assert.equal(body.scores['other-student-line'], undefined);
+  assert.equal(body.flows['basic_a/unit1'], undefined);
+});
+
 test('createPackSync refuses savePack before loadPack', async () => {
   const saves = [];
   const storage = {
@@ -70,8 +117,6 @@ test('createPackSync refuses savePack before loadPack', async () => {
     storage,
     window: { addEventListener() {} },
     document: { visibilityState: 'visible' },
-    legacyScoreKey: 'legacy-scores',
-    legacyFlowKey: 'legacy-flows',
     getAuth: () => ({
       student: () => 'TestKid',
       progressError: () => '',
@@ -84,8 +129,8 @@ test('createPackSync refuses savePack before loadPack', async () => {
       packReady: (program) => program === PACK_PROGRAM,
     }),
     setActiveStudent() {},
-    scoreStorageKey: () => storageKeyForStudent('legacy-scores', 'TestKid'),
-    flowStorageKey: () => storageKeyForStudent('legacy-flows', 'TestKid'),
+    scoreStorageKey: () => storageKeyForStudent(LEGACY_SCORE_KEY, 'TestKid'),
+    flowStorageKey: () => storageKeyForStudent(LEGACY_FLOW_KEY, 'TestKid'),
   });
 
   sync.markDirty();

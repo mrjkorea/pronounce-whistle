@@ -228,15 +228,9 @@ export function readJsonStorage(storage, key) {
   }
 }
 
-export function migrateLegacyStorage(storage, legacyKey, studentKey, mergeFn) {
-  const legacy = readJsonStorage(storage, legacyKey);
-  if (!Object.keys(legacy).length) return readJsonStorage(storage, studentKey);
-  const current = readJsonStorage(storage, studentKey);
-  const merged = mergeFn(current, legacy);
-  try {
-    storage.setItem(studentKey, JSON.stringify(merged));
-  } catch (_) {}
-  return merged;
+/** Per-student keys only — never read or copy the device-wide legacy key (shared lab PCs). */
+export function readStudentStorage(storage, studentKey) {
+  return readJsonStorage(storage, studentKey);
 }
 
 export function packSaveAllowed(state) {
@@ -259,11 +253,10 @@ export function createPackSync(deps) {
   }
 
   function readLocal() {
-    const scoreKey = deps.scoreStorageKey();
-    const flowKey = deps.flowStorageKey();
-    const scores = migrateLegacyStorage(deps.storage, deps.legacyScoreKey, scoreKey, mergeScoreMaps);
-    const flows = migrateLegacyStorage(deps.storage, deps.legacyFlowKey, flowKey, mergeFlowBooks);
-    return { scores, flows };
+    return {
+      scores: readStudentStorage(deps.storage, deps.scoreStorageKey()),
+      flows: readStudentStorage(deps.storage, deps.flowStorageKey()),
+    };
   }
 
   function writeLocal(scores, flows) {

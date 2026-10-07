@@ -8,7 +8,6 @@ import {
 } from './whistle-progress.js?v=20261007-progress-1';
 import {
   FLOW_STORAGE_KEY,
-  LEGACY_SCORE_KEY,
   LOCK_TEXT,
   advanceFlow,
   canStartMic,
@@ -105,8 +104,6 @@ const packSync = typeof localStorage !== 'undefined' ? createPackSync({
   storage: localStorage,
   window,
   document,
-  legacyScoreKey: LEGACY_SCORE_KEY,
-  legacyFlowKey: FLOW_STORAGE_KEY,
   getAuth: () => window.MRJ_AUTH,
   setActiveStudent: (suffix) => { activeStudentSuffix = suffix; },
   scoreStorageKey: () => storageKeyForStudent(SCORE_KEY, activeStudentSuffix),
