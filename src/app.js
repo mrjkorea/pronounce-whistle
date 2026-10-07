@@ -1,8 +1,14 @@
 import { decodeAudioToMono, audioStats, trimSilence, capSpeechWindow } from './audio.js';
-import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-easy';
+import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-progress-1';
 import { sheetLines } from './sheet.js';
 import {
+  createPackSync,
+  resolveStudentId,
+  storageKeyForStudent,
+} from './whistle-progress.js?v=20261007-progress-1';
+import {
   FLOW_STORAGE_KEY,
+  LEGACY_SCORE_KEY,
   LOCK_TEXT,
   advanceFlow,
   canStartMic,
@@ -21,7 +27,7 @@ import {
   timerRunning,
   timerSeconds,
   tryTeacherPassword,
-} from './flow.js?v=20261006-stop2';
+} from './flow.js?v=20261007-progress-1';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
@@ -93,6 +99,28 @@ let chainTail = Promise.resolve();
 let scoreTail = Promise.resolve();
 let clockTimer = null;
 let teacherMiss = {};
+let activeStudentSuffix = '';
+
+const packSync = typeof localStorage !== 'undefined' ? createPackSync({
+  storage: localStorage,
+  window,
+  document,
+  legacyScoreKey: LEGACY_SCORE_KEY,
+  legacyFlowKey: FLOW_STORAGE_KEY,
+  getAuth: () => window.MRJ_AUTH,
+  setActiveStudent: (suffix) => { activeStudentSuffix = suffix; },
+  scoreStorageKey: () => storageKeyForStudent(SCORE_KEY, activeStudentSuffix),
+  flowStorageKey: () => storageKeyForStudent(FLOW_STORAGE_KEY, activeStudentSuffix),
+  onSynced: () => { if (books.length) render(); },
+}) : null;
+
+function scoresStorageKey() {
+  return storageKeyForStudent(SCORE_KEY, activeStudentSuffix);
+}
+
+function flowsStorageKey() {
+  return storageKeyForStudent(FLOW_STORAGE_KEY, activeStudentSuffix);
+}
 
 function koreanCode(korean) {
   const m = String(korean || '').match(/^([A-Z0-9()]+)\?\s*/);
@@ -218,7 +246,7 @@ function logToOneBook(itemId, graded) {
 
 function loadScores() {
   try {
-    const raw = JSON.parse(localStorage.getItem(SCORE_KEY) || '{}');
+    const raw = JSON.parse(localStorage.getItem(scoresStorageKey()) || '{}');
     return raw && typeof raw === 'object' ? raw : {};
   } catch (_) {
     return {};
@@ -226,7 +254,8 @@ function loadScores() {
 }
 
 function saveScores(scores) {
-  localStorage.setItem(SCORE_KEY, JSON.stringify(scores));
+  localStorage.setItem(scoresStorageKey(), JSON.stringify(scores));
+  if (packSync) packSync.markDirty();
 }
 
 function flowKey(bookId, unitId) {
@@ -235,7 +264,7 @@ function flowKey(bookId, unitId) {
 
 function loadFlowBook() {
   try {
-    const raw = JSON.parse(localStorage.getItem(FLOW_STORAGE_KEY) || '{}');
+    const raw = JSON.parse(localStorage.getItem(flowsStorageKey()) || '{}');
     return raw && typeof raw === 'object' ? raw : {};
   } catch (_) {
     return {};
@@ -249,7 +278,8 @@ function loadUnitFlow(bookId, unitId) {
 function saveUnitFlow(bookId, unitId, flow) {
   const all = loadFlowBook();
   all[flowKey(bookId, unitId)] = flow;
-  localStorage.setItem(FLOW_STORAGE_KEY, JSON.stringify(all));
+  localStorage.setItem(flowsStorageKey(), JSON.stringify(all));
+  if (packSync) packSync.markDirty();
 }
 
 function chain(fn) {
@@ -1150,8 +1180,7 @@ async function gradeBlob(blob, english) {
 function noteScoreToAuth(itemId, scorePct) {
   const auth = window.MRJ_AUTH;
   if (!auth || typeof auth.noteScore !== 'function' || typeof auth.student !== 'function') return;
-  const student = auth.student();
-  if (!student || !student.id) return;
+  if (!resolveStudentId(auth)) return;
   auth.noteScore({
     program: 'pronounce',
     itemId: 'whistle:' + itemId,
@@ -1345,6 +1374,13 @@ if (appEl) {
     console.error(err);
   });
   bootModel();
+
+  if (packSync) {
+    packSync.installFlushHooks();
+    window.addEventListener('mrj-auth-ready', (ev) => {
+      void packSync.onAuthReady((ev && ev.detail) || {});
+    });
+  }
 }
 
 export {
