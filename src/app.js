@@ -1,11 +1,11 @@
 import { decodeAudioToMono, audioStats, trimSilence, capSpeechWindow } from './audio.js';
-import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-progress-1';
+import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-progress-2';
 import { sheetLines } from './sheet.js';
 import {
   createPackSync,
   resolveStudentId,
   storageKeyForStudent,
-} from './whistle-progress.js?v=20261007-progress-1';
+} from './whistle-progress.js?v=20261007-progress-2';
 import {
   FLOW_STORAGE_KEY,
   LOCK_TEXT,
@@ -26,7 +26,7 @@ import {
   timerRunning,
   timerSeconds,
   tryTeacherPassword,
-} from './flow.js?v=20261007-progress-1';
+} from './flow.js?v=20261007-progress-2';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
