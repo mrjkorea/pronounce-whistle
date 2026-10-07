@@ -267,3 +267,110 @@ test('flushSave skips when not dirty even if forced (pagehide)', async () => {
   await sync.flushSave(true);
   assert.equal(saves.length, 0);
 });
+
+test('loadPackWithRetry retries stale_session for the current session', async () => {
+  let calls = 0;
+  const auth = { loadPack: async () => {
+    calls += 1;
+    if (calls === 1) return { ok: false, error: 'stale_session' };
+    return { ok: true, progress_json: '{}' };
+  } };
+  const guard = {
+    isCurrent() { return true; },
+  };
+  const result = await loadPackWithRetry(auth, PACK_PROGRAM, [0, 0], null, guard);
+  assert.equal(result.ok, true);
+  assert.equal(calls, 2);
+});
+
+test('previous student late failed load does not block next student saves', async () => {
+  let resolvePackA;
+  const packA = new Promise((resolve) => { resolvePackA = resolve; });
+  let currentStudent = 'Alice';
+  const saves = [];
+  let activeSuffix = '';
+  const storage = {
+    data: {},
+    getItem(key) { return this.data[key] || null; },
+    setItem(key, value) { this.data[key] = value; },
+  };
+  const sync = createPackSync({
+    storage,
+    window: { addEventListener() {} },
+    document: { visibilityState: 'visible' },
+    loadPackRetryDelays: [0],
+    getAuth: () => ({
+      student: () => currentStudent,
+      progressError: () => '',
+      loadProgressForApp: async () => ({ ok: true, progress: [] }),
+      loadPack: () => (currentStudent === 'Alice' ? packA : Promise.resolve({ ok: true, progress_json: '{}' })),
+      savePack: async (program, json) => {
+        saves.push({ program, json, student: currentStudent });
+        return { ok: true };
+      },
+      packReady: (program) => program === PACK_PROGRAM,
+    }),
+    setActiveStudent: (suffix) => { activeSuffix = suffix; },
+    scoreStorageKey: () => storageKeyForStudent(LEGACY_SCORE_KEY, activeSuffix),
+    flowStorageKey: () => storageKeyForStudent(LEGACY_FLOW_KEY, activeSuffix),
+  });
+
+  const aliceReady = sync.onAuthReady({ progress: [] });
+  currentStudent = 'Bob';
+  await sync.onAuthReady({ progress: [] });
+  assert.equal(sync.state.packLoadOk, true);
+  assert.equal(sync.state.packLoadFailed, false);
+
+  resolvePackA({ ok: false, error: 'network' });
+  await aliceReady;
+
+  assert.equal(sync.state.packLoadOk, true);
+  assert.equal(sync.state.packLoadFailed, false);
+  sync.markDirty();
+  await sync.flushSave(true);
+  assert.equal(saves.length, 1);
+});
+
+test('previous student late successful load does not merge into next student', async () => {
+  let resolvePackA;
+  const packA = new Promise((resolve) => { resolvePackA = resolve; });
+  let currentStudent = 'Alice';
+  let activeSuffix = '';
+  const storage = {
+    data: {},
+    getItem(key) { return this.data[key] || null; },
+    setItem(key, value) { this.data[key] = value; },
+  };
+  const alicePack = serializeProgressPack(
+    { 'alice-only': { scorePct: 99, pass: true, at: 1 } },
+    {},
+  );
+  const bobKey = storageKeyForStudent(LEGACY_SCORE_KEY, 'bob');
+  const sync = createPackSync({
+    storage,
+    window: { addEventListener() {} },
+    document: { visibilityState: 'visible' },
+    loadPackRetryDelays: [0],
+    getAuth: () => ({
+      student: () => currentStudent,
+      progressError: () => '',
+      loadProgressForApp: async () => ({ ok: true, progress: [] }),
+      loadPack: () => (currentStudent === 'Alice' ? packA : Promise.resolve({ ok: true, progress_json: '{}' })),
+      savePack: async () => ({ ok: true }),
+      packReady: (program) => program === PACK_PROGRAM,
+    }),
+    setActiveStudent: (suffix) => { activeSuffix = suffix; },
+    scoreStorageKey: () => storageKeyForStudent(LEGACY_SCORE_KEY, activeSuffix),
+    flowStorageKey: () => storageKeyForStudent(LEGACY_FLOW_KEY, activeSuffix),
+  });
+
+  const aliceReady = sync.onAuthReady({ progress: [] });
+  currentStudent = 'Bob';
+  await sync.onAuthReady({ progress: [] });
+
+  resolvePackA({ ok: true, found: true, progress_json: alicePack });
+  await aliceReady;
+
+  const bobScores = readJsonStorage(storage, bobKey);
+  assert.equal(bobScores['alice-only'], undefined);
+});

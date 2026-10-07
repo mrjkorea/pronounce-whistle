@@ -1,11 +1,11 @@
 import { decodeAudioToMono, audioStats, trimSilence, capSpeechWindow } from './audio.js';
-import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-progress-2';
+import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-progress-3';
 import { sheetLines } from './sheet.js';
 import {
   createPackSync,
   resolveStudentId,
   storageKeyForStudent,
-} from './whistle-progress.js?v=20261007-progress-2';
+} from './whistle-progress.js?v=20261007-progress-3';
 import {
   FLOW_STORAGE_KEY,
   LOCK_TEXT,
@@ -26,7 +26,7 @@ import {
   timerRunning,
   timerSeconds,
   tryTeacherPassword,
-} from './flow.js?v=20261007-progress-2';
+} from './flow.js?v=20261007-progress-3';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
@@ -1375,6 +1375,15 @@ if (appEl) {
   if (packSync) {
     packSync.installFlushHooks();
     window.addEventListener('mrj-auth-ready', (ev) => {
+      const auth = window.MRJ_AUTH;
+      if (auth && typeof auth.signOut === 'function' && !auth.__whistlePackSignOutHooked) {
+        auth.__whistlePackSignOutHooked = true;
+        const previousSignOut = auth.signOut.bind(auth);
+        auth.signOut = function whistlePackSignOut() {
+          packSync.onSignOut();
+          return previousSignOut();
+        };
+      }
       void packSync.onAuthReady((ev && ev.detail) || {});
     });
   }

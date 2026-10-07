@@ -13,18 +13,46 @@ export function delayMs(ms, delayFn) {
   return wait(ms);
 }
 
-export async function loadPackWithRetry(auth, program, retryDelays, delayFn) {
+export function createSessionGuard(sessionGen, idKey, isCurrentFn) {
+  return {
+    sessionGen,
+    idKey,
+    isCurrent() {
+      return typeof isCurrentFn === 'function' && isCurrentFn(sessionGen, idKey);
+    },
+  };
+}
+
+export async function loadPackWithRetry(auth, program, retryDelays, delayFn, sessionGuard) {
   if (!auth || typeof auth.loadPack !== 'function') {
     return { ok: false, error: 'pack_load_failed' };
+  }
+  if (sessionGuard && !sessionGuard.isCurrent()) {
+    return { ok: false, error: 'stale_session', aborted: true };
   }
   const delays = Array.isArray(retryDelays) && retryDelays.length
     ? retryDelays
     : PACK_LOAD_RETRY_DELAYS_MS;
   let last = { ok: false, error: 'pack_load_failed' };
   for (let i = 0; i < delays.length; i++) {
-    if (i > 0 && delays[i]) await delayMs(delays[i], delayFn);
+    if (sessionGuard && !sessionGuard.isCurrent()) {
+      return { ok: false, error: 'stale_session', aborted: true };
+    }
+    if (i > 0 && delays[i]) {
+      await delayMs(delays[i], delayFn);
+      if (sessionGuard && !sessionGuard.isCurrent()) {
+        return { ok: false, error: 'stale_session', aborted: true };
+      }
+    }
     last = await auth.loadPack(program);
+    if (sessionGuard && !sessionGuard.isCurrent()) {
+      return { ok: false, error: 'stale_session', aborted: true };
+    }
     if (last && last.ok) return last;
+    if (last && String(last.error) === 'stale_session') {
+      last = { ok: false, error: 'stale_session' };
+      continue;
+    }
   }
   return last || { ok: false, error: 'pack_load_failed' };
 }
@@ -260,8 +288,11 @@ export function packSaveAllowed(state) {
 }
 
 export function createPackSync(deps) {
+  let sessionGen = 0;
   const state = {
     studentSuffix: '',
+    idKey: '',
+    sessionGen: 0,
     packLoaded: false,
     packLoadOk: false,
     packLoadFailed: false,
@@ -275,6 +306,47 @@ export function createPackSync(deps) {
 
   function auth() {
     return deps.getAuth();
+  }
+
+  function sessionMatches(gen, idKey) {
+    const a = auth();
+    const liveKey = studentStorageSuffix(resolveStudentId(a));
+    return state.sessionGen === gen
+      && state.idKey === idKey
+      && liveKey === idKey;
+  }
+
+  function makeGuard(gen, idKey) {
+    return createSessionGuard(gen, idKey, sessionMatches);
+  }
+
+  function clearSaveTimer() {
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+  }
+
+  function resetPackSyncState() {
+    state.packLoaded = false;
+    state.packLoadOk = false;
+    state.packLoadFailed = false;
+    state.dirty = false;
+    state.serverScores = {};
+    state.serverFlows = {};
+    state.serverPackBody = serializeProgressPack({}, {});
+  }
+
+  function beginSession(suffix) {
+    clearSaveTimer();
+    if (suffix !== state.idKey) {
+      resetPackSyncState();
+    }
+    sessionGen += 1;
+    state.sessionGen = sessionGen;
+    state.idKey = suffix;
+    state.studentSuffix = suffix;
+    return makeGuard(sessionGen, suffix);
   }
 
   function readLocal() {
@@ -322,6 +394,10 @@ export function createPackSync(deps) {
   async function flushSave(bypassThrottle) {
     if (!state.dirty) return;
     if (!packSaveAllowed(state)) return;
+    const flushGen = state.sessionGen;
+    const flushIdKey = state.idKey;
+    const guard = makeGuard(flushGen, flushIdKey);
+    if (!guard.isCurrent()) return;
     const a = auth();
     if (!a || typeof a.savePack !== 'function' || typeof a.packReady !== 'function') return;
     if (!a.packReady(PACK_PROGRAM)) return;
@@ -333,11 +409,15 @@ export function createPackSync(deps) {
     const { merged, body } = buildSavePayload();
     state.dirty = false;
     const result = await a.savePack(PACK_PROGRAM, body);
+    if (!guard.isCurrent()) return;
     if (result && result.ok) {
       state.lastSaveAt = now;
       state.serverScores = merged.scores;
       state.serverFlows = merged.flows;
       state.serverPackBody = body;
+    } else if (result && String(result.error) === 'stale_session') {
+      state.dirty = true;
+      scheduleSave();
     } else {
       state.dirty = true;
       state.packLoadFailed = true;
@@ -345,16 +425,19 @@ export function createPackSync(deps) {
     }
   }
 
-  async function loadProgressRows(a, detail) {
+  async function loadProgressRows(a, detail, sessionGuard) {
     if (typeof a.loadProgressForApp === 'function') {
       const result = await a.loadProgressForApp(SCORE_PROGRAM);
+      if (sessionGuard && !sessionGuard.isCurrent()) return [];
       if (result && result.ok && Array.isArray(result.progress)) return result.progress;
     }
+    if (sessionGuard && !sessionGuard.isCurrent()) return [];
     if (detail && Array.isArray(detail.progress)) return detail.progress;
     return [];
   }
 
-  function applyPackMerge(progressRows, packResult) {
+  function applyPackMerge(progressRows, packResult, sessionGuard) {
+    if (sessionGuard && !sessionGuard.isCurrent()) return null;
     const fresh = readLocal();
     let scores = mergeScoreMaps(fresh.scores, scoresFromProgressRows(progressRows));
     const flows = fresh.flows;
@@ -382,45 +465,46 @@ export function createPackSync(deps) {
     const a = auth();
     const studentId = resolveStudentId(a);
     const suffix = studentStorageSuffix(studentId);
-    state.studentSuffix = suffix;
-    deps.setActiveStudent(suffix);
     if (!suffix) return;
+
+    const sessionGuard = beginSession(suffix);
+    deps.setActiveStudent(suffix);
 
     if (!a || typeof a.loadPack !== 'function') {
       if (typeof deps.onSynced === 'function') deps.onSynced();
       return;
     }
 
-    state.packLoaded = false;
-    state.packLoadOk = false;
-    state.packLoadFailed = false;
-    state.serverScores = {};
-    state.serverFlows = {};
-    state.serverPackBody = serializeProgressPack({}, {});
+    resetPackSyncState();
 
     const progressErr = a && typeof a.progressError === 'function' ? String(a.progressError() || '') : '';
     const progressPromise = progressErr
       ? Promise.resolve([])
-      : loadProgressRows(a, detail);
+      : loadProgressRows(a, detail, sessionGuard);
     const packPromise = loadPackWithRetry(
       a,
       PACK_PROGRAM,
       deps.loadPackRetryDelays,
       deps.delayMs,
+      sessionGuard,
     );
 
     const [progressRows, packResult] = await Promise.all([progressPromise, packPromise]);
 
+    if (!sessionGuard.isCurrent()) return;
+    if (packResult && packResult.aborted) return;
+
     if (!packResult || !packResult.ok) {
       state.packLoadFailed = true;
-      applyPackMerge(progressRows, null);
+      applyPackMerge(progressRows, null, sessionGuard);
       if (typeof deps.onSynced === 'function') deps.onSynced();
       return;
     }
 
     state.packLoaded = true;
     state.packLoadOk = true;
-    const merged = applyPackMerge(progressRows, packResult);
+    const merged = applyPackMerge(progressRows, packResult, sessionGuard);
+    if (!sessionGuard.isCurrent()) return;
     const mergedBody = merged
       ? serializeProgressPack(merged.scores, merged.flows)
       : state.serverPackBody;
@@ -430,18 +514,12 @@ export function createPackSync(deps) {
   }
 
   function onSignOut() {
+    sessionGen += 1;
+    state.sessionGen = sessionGen;
     state.studentSuffix = '';
-    state.packLoaded = false;
-    state.packLoadOk = false;
-    state.packLoadFailed = false;
-    state.dirty = false;
-    state.serverScores = {};
-    state.serverFlows = {};
-    state.serverPackBody = serializeProgressPack({}, {});
-    if (state.timer) {
-      clearTimeout(state.timer);
-      state.timer = null;
-    }
+    state.idKey = '';
+    clearSaveTimer();
+    resetPackSyncState();
     deps.setActiveStudent('');
   }
 
