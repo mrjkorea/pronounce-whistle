@@ -6,6 +6,28 @@ export const PACK_PROGRAM = 'pronounce-whistle';
 export const SCORE_PROGRAM = 'pronounce';
 export const WHISTLE_ITEM_PREFIX = 'whistle:';
 export const REMOTE_SAVE_MS = 17000;
+export const PACK_LOAD_RETRY_DELAYS_MS = [0, 1500, 3000];
+
+export function delayMs(ms, delayFn) {
+  const wait = delayFn || ((n) => new Promise((resolve) => { setTimeout(resolve, n); }));
+  return wait(ms);
+}
+
+export async function loadPackWithRetry(auth, program, retryDelays, delayFn) {
+  if (!auth || typeof auth.loadPack !== 'function') {
+    return { ok: false, error: 'pack_load_failed' };
+  }
+  const delays = Array.isArray(retryDelays) && retryDelays.length
+    ? retryDelays
+    : PACK_LOAD_RETRY_DELAYS_MS;
+  let last = { ok: false, error: 'pack_load_failed' };
+  for (let i = 0; i < delays.length; i++) {
+    if (i > 0 && delays[i]) await delayMs(delays[i], delayFn);
+    last = await auth.loadPack(program);
+    if (last && last.ok) return last;
+  }
+  return last || { ok: false, error: 'pack_load_failed' };
+}
 
 export function studentStorageSuffix(studentId) {
   return String(studentId == null ? '' : studentId)
@@ -246,6 +268,9 @@ export function createPackSync(deps) {
     dirty: false,
     lastSaveAt: 0,
     timer: null,
+    serverScores: {},
+    serverFlows: {},
+    serverPackBody: serializeProgressPack({}, {}),
   };
 
   function auth() {
@@ -280,18 +305,39 @@ export function createPackSync(deps) {
     }, wait);
   }
 
-  async function flushSave(force) {
-    if (!state.dirty && !force) return;
+  function buildSavePayload() {
+    const fresh = readLocal();
+    const merged = mergePackContents(
+      fresh.scores,
+      fresh.flows,
+      state.serverScores,
+      state.serverFlows,
+    );
+    return {
+      merged,
+      body: serializeProgressPack(merged.scores, merged.flows),
+    };
+  }
+
+  async function flushSave(bypassThrottle) {
+    if (!state.dirty) return;
     if (!packSaveAllowed(state)) return;
     const a = auth();
     if (!a || typeof a.savePack !== 'function' || typeof a.packReady !== 'function') return;
     if (!a.packReady(PACK_PROGRAM)) return;
-    const { scores, flows } = readLocal();
-    const body = serializeProgressPack(scores, flows);
+    const now = Date.now();
+    if (!bypassThrottle && now - state.lastSaveAt < REMOTE_SAVE_MS) {
+      scheduleSave();
+      return;
+    }
+    const { merged, body } = buildSavePayload();
     state.dirty = false;
     const result = await a.savePack(PACK_PROGRAM, body);
     if (result && result.ok) {
-      state.lastSaveAt = Date.now();
+      state.lastSaveAt = now;
+      state.serverScores = merged.scores;
+      state.serverFlows = merged.flows;
+      state.serverPackBody = body;
     } else {
       state.dirty = true;
       state.packLoadFailed = true;
@@ -308,6 +354,30 @@ export function createPackSync(deps) {
     return [];
   }
 
+  function applyPackMerge(progressRows, packResult) {
+    const fresh = readLocal();
+    let scores = mergeScoreMaps(fresh.scores, scoresFromProgressRows(progressRows));
+    const flows = fresh.flows;
+
+    if (!packResult || !packResult.ok) {
+      writeLocal(scores, flows);
+      return null;
+    }
+
+    const parsed = parseProgressPack(packResult.progress_json);
+    const remoteScores = parsed.unparseable ? {} : parsed.scores;
+    const remoteFlows = parsed.unparseable ? {} : parsed.flows;
+    state.serverScores = remoteScores;
+    state.serverFlows = remoteFlows;
+    state.serverPackBody = serializeProgressPack(remoteScores, remoteFlows);
+
+    const latest = readLocal();
+    scores = mergeScoreMaps(latest.scores, scoresFromProgressRows(progressRows));
+    const merged = mergePackContents(scores, latest.flows, remoteScores, remoteFlows);
+    writeLocal(merged.scores, merged.flows);
+    return merged;
+  }
+
   async function onAuthReady(detail) {
     const a = auth();
     const studentId = resolveStudentId(a);
@@ -315,18 +385,6 @@ export function createPackSync(deps) {
     state.studentSuffix = suffix;
     deps.setActiveStudent(suffix);
     if (!suffix) return;
-
-    let { scores, flows } = readLocal();
-
-    const progressErr = a && typeof a.progressError === 'function' ? String(a.progressError() || '') : '';
-    const progressRows = progressErr
-      ? []
-      : await loadProgressRows(a, detail);
-    const seeded = scoresFromProgressRows(progressRows);
-    if (Object.keys(seeded).length) {
-      scores = mergeScoreMaps(scores, seeded);
-      writeLocal(scores, flows);
-    }
 
     if (!a || typeof a.loadPack !== 'function') {
       if (typeof deps.onSynced === 'function') deps.onSynced();
@@ -336,24 +394,37 @@ export function createPackSync(deps) {
     state.packLoaded = false;
     state.packLoadOk = false;
     state.packLoadFailed = false;
+    state.serverScores = {};
+    state.serverFlows = {};
+    state.serverPackBody = serializeProgressPack({}, {});
 
-    const packResult = await a.loadPack(PACK_PROGRAM);
+    const progressErr = a && typeof a.progressError === 'function' ? String(a.progressError() || '') : '';
+    const progressPromise = progressErr
+      ? Promise.resolve([])
+      : loadProgressRows(a, detail);
+    const packPromise = loadPackWithRetry(
+      a,
+      PACK_PROGRAM,
+      deps.loadPackRetryDelays,
+      deps.delayMs,
+    );
+
+    const [progressRows, packResult] = await Promise.all([progressPromise, packPromise]);
+
     if (!packResult || !packResult.ok) {
       state.packLoadFailed = true;
+      applyPackMerge(progressRows, null);
       if (typeof deps.onSynced === 'function') deps.onSynced();
       return;
     }
 
     state.packLoaded = true;
     state.packLoadOk = true;
-    const parsed = parseProgressPack(packResult.progress_json);
-    const remoteScores = parsed.unparseable ? {} : parsed.scores;
-    const remoteFlows = parsed.unparseable ? {} : parsed.flows;
-    const merged = mergePackContents(scores, flows, remoteScores, remoteFlows);
-    writeLocal(merged.scores, merged.flows);
-    const remoteBody = serializeProgressPack(remoteScores, remoteFlows);
-    const mergedBody = serializeProgressPack(merged.scores, merged.flows);
-    state.dirty = mergedBody !== remoteBody;
+    const merged = applyPackMerge(progressRows, packResult);
+    const mergedBody = merged
+      ? serializeProgressPack(merged.scores, merged.flows)
+      : state.serverPackBody;
+    state.dirty = mergedBody !== state.serverPackBody;
     if (state.dirty) scheduleSave();
     if (typeof deps.onSynced === 'function') deps.onSynced();
   }
@@ -364,6 +435,9 @@ export function createPackSync(deps) {
     state.packLoadOk = false;
     state.packLoadFailed = false;
     state.dirty = false;
+    state.serverScores = {};
+    state.serverFlows = {};
+    state.serverPackBody = serializeProgressPack({}, {});
     if (state.timer) {
       clearTimeout(state.timer);
       state.timer = null;
