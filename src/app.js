@@ -27,6 +27,7 @@ import {
   timerSeconds,
   tryTeacherPassword,
 } from './flow.js?v=20261007-progress-3';
+import { persistScoredTry } from './score-persist.js?v=20261011-savefix';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
@@ -221,23 +222,33 @@ function itemRowPassed(item, unit, scores) {
 }
 
 
-// Jay 28SEP2026: ONE score book — pronounce grades log here too.
-function logToOneBook(itemId, graded) {
+function bookUnitTitles(bookId, unitId) {
+  const book = byId.get(bookId);
+  const unit = book && book.units.find((u) => u.id === unitId);
+  return {
+    bookTitle: book ? book.label : '',
+    unitTitle: unit ? unit.label : '',
+  };
+}
+
+function persistScoresToCloud(meta, record, thrown, failReason) {
   const auth = window.MRJ_AUTH;
-  const who = auth && typeof auth.student === 'function' ? String(auth.student() || '').trim() : '';
-  if (!window.MRJ_SCORES || !graded || !who || !itemId) return;
-  window.MRJ_SCORES.post({
-    student: who,
-    program: 'pronounce',
-    appName: 'Pronounce · Whistle',
-    source: 'pronounce',
-    itemId: 'whistle:' + itemId,
-    itemType: 'pronunciation',
-    scoreValue: Number(graded.scorePct || 0),
-    scoreMax: 100,
-    scorePct: Number(graded.scorePct || 0),
-    correctness: graded.pass ? 'correct' : 'incorrect',
-    metadata: { english: graded.english || '', weak: graded.weak || [] },
+  if (!window.MRJ_SCORES || !meta.itemId) return;
+  const studentId = auth ? resolveStudentId(auth) : '';
+  const titles = bookUnitTitles(meta.bookId, meta.unitId);
+  persistScoredTry({
+    itemId: meta.itemId,
+    record,
+    thrown,
+    failReason,
+    studentId,
+    localDateFn: () => window.MRJ_SCORES.localDate(),
+    noteScore: (args) => {
+      if (!auth || typeof auth.noteScore !== 'function') return;
+      auth.noteScore(args);
+    },
+    post: (opts) => { window.MRJ_SCORES.post(opts); },
+    titles,
   });
 }
 
@@ -1081,8 +1092,7 @@ async function gradeStudentOrTeacher(meta, blob, serial) {
     scores[meta.scoreKey] = record;
     saveScores(scores);
     if (meta.itemId) {
-      noteScoreToAuth(meta.itemId, record.scorePct);
-      logToOneBook(meta.itemId, record);
+      persistScoresToCloud(meta, record, !!thrown, failReason);
     }
     if (stillOnSheet(meta.bookId, meta.unitId)) {
       const gradeText = meta.gradeText;
@@ -1172,19 +1182,6 @@ async function gradeBlob(blob, english) {
     words: judged.words,
     heard: judged.heard,
   };
-}
-
-function noteScoreToAuth(itemId, scorePct) {
-  const auth = window.MRJ_AUTH;
-  if (!auth || typeof auth.noteScore !== 'function' || typeof auth.student !== 'function') return;
-  if (!resolveStudentId(auth)) return;
-  auth.noteScore({
-    program: 'pronounce',
-    itemId: 'whistle:' + itemId,
-    scoreValue: Math.round(scorePct),
-    scoreMax: 100,
-    scorePct: Math.round(scorePct),
-  });
 }
 
 function playAudioUrl(url, times = 1) {
