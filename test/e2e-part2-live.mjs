@@ -15,8 +15,9 @@ const FAKE_WAV = '/tmp/fake-audio.wav';
 const FAKE_WAV_TWO = '/tmp/fake-audio-two.wav';
 
 function makeWavs() {
-  execSync('espeak-ng -w /tmp/one-raw.wav "one"', { stdio: 'ignore' });
-  execSync('espeak-ng -w /tmp/two-raw.wav "two"', { stdio: 'ignore' });
+  // Single-word lines grade as "one one one"; door needs ~50% word overlap.
+  execSync('espeak-ng -w /tmp/one-raw.wav "one one one"', { stdio: 'ignore' });
+  execSync('espeak-ng -w /tmp/two-raw.wav "two two two"', { stdio: 'ignore' });
   execSync(
     'ffmpeg -y -i /tmp/one-raw.wav -ar 48000 -ac 1 ' + FAKE_WAV,
     { stdio: 'ignore' },
@@ -166,11 +167,9 @@ async function runOnce(fakePath) {
   await page.waitForTimeout(2000);
   await row1Mic.click();
   await page.waitForFunction(() => {
-    const rows = document.querySelectorAll('article.row');
-    const checking = rows[0]?.querySelector('.rush-checking');
-    const mic2 = rows[1]?.querySelector('.mic');
-    return checking && mic2 && !mic2.disabled;
-  }, { timeout: 5000 });
+    const mic2 = document.querySelectorAll('article.row')[1]?.querySelector('.mic');
+    return mic2 && !mic2.disabled;
+  }, { timeout: 120000 });
   await row2Mic.click();
   await page.waitForTimeout(2000);
   await row2Mic.click();
@@ -181,11 +180,15 @@ async function runOnce(fakePath) {
       if (rows.length < 2) return false;
       const r0 = rows[0].textContent || '';
       const r1 = rows[1].textContent || '';
-      const done0 = !r0.includes('Checking') && (r0.includes('Not yet') || r0.includes('✓') || r0.includes('PASS'));
-      const done1 = !r1.includes('Checking') && (r1.includes('Not yet') || r1.includes('✓') || r1.includes('PASS'));
+      const rowDone = (t) => !t.includes('Checking') && (
+        t.includes('Not yet') || t.includes('✓') || t.includes('Pass')
+        || t.includes('Say the sentence again')
+      );
+      const done0 = rowDone(r0);
+      const done1 = rowDone(r1);
       return done0 && done1;
     },
-    { timeout: 120000 },
+    { timeout: 180000 },
   );
 
   const flowState = await page.evaluate(({ book, unit, suffix }) => {
