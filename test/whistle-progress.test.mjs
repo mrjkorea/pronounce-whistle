@@ -8,7 +8,10 @@ import {
   loadPackWithRetry,
   mergeScoreMaps,
   mergeScoreRecord,
+  mergeFlowState,
+  mergePackContents,
   packSaveAllowed,
+  PACK_PART2_LIMIT_SEC,
   parseProgressPack,
   parseProgressScore,
   resolveStudentId,
@@ -40,6 +43,27 @@ test('mergeScoreRecord keeps the best score and earliest timestamp', () => {
 test('mergeScoreMaps does not let empty remote wipe local data', () => {
   const local = { a: { scorePct: 90, pass: true, at: 1 } };
   assert.deepEqual(mergeScoreMaps(local, {}), local);
+});
+
+test('mergeFlowState keeps both rush grade rows for pack sync', () => {
+  const a = {
+    phase: 'part2',
+    rushGrades: { line1: { pass: true, scorePct: 100, words: [{ word: 'one', score: 1 }] } },
+    rushRecorded: { line1: true },
+    part2: { limitSec: 60, wordCount: 5, startedAt: 1, stoppedAt: 0, secondsUsed: null },
+  };
+  const b = {
+    phase: 'part2',
+    rushGrades: { line2: { pass: false, scorePct: 0, words: [] } },
+    rushRecorded: { line2: true },
+    part2: { limitSec: 90, wordCount: 5, startedAt: 2, stoppedAt: 0, secondsUsed: null },
+  };
+  const merged = mergeFlowState(a, b);
+  assert.equal(merged.rushGrades.line1.pass, true);
+  assert.equal(merged.rushGrades.line2.pass, false);
+  assert.equal(merged.part2.limitSec, PACK_PART2_LIMIT_SEC);
+  const pack = parseProgressPack(serializeProgressPack({}, { 'book/u': merged }));
+  assert.equal(pack.flows['book/u'].rushGrades.line1.scorePct, 100);
 });
 
 test('parseProgressPack treats bad server JSON as empty-but-loaded', () => {
