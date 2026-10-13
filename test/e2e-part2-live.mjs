@@ -27,13 +27,11 @@ function makeWavs() {
   );
 }
 
-async function waitWhistleReady(page, timeoutMs = 180000) {
+async function waitCheckerReady(page, timeoutMs = 300000) {
   await page.waitForFunction(
     () => {
       const el = document.getElementById('modelLabel');
-      if (!el) return false;
-      const t = el.textContent || '';
-      return t.includes('70 percent') || t.includes('Easy');
+      return el && el.classList.contains('done');
     },
     { timeout: timeoutMs },
   );
@@ -145,11 +143,11 @@ async function runOnce(fakePath) {
   });
 
   await registerStudent(page, studentId, password);
-  await waitWhistleReady(page);
+  await waitCheckerReady(page);
   await waitPackLoaded(page);
   const sheetUrl = `${BASE}#/book/${BOOK}/unit/${UNIT}`;
   await page.goto(sheetUrl, { waitUntil: 'domcontentloaded' });
-  await waitWhistleReady(page);
+  await waitCheckerReady(page);
   await seedPart2(page, studentId);
   await page.goto(sheetUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.rush-limit', { timeout: 60000 });

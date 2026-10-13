@@ -21,10 +21,10 @@ function studentSuffix(studentId) {
   return String(studentId).trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
-async function waitWhistleReady(page) {
+async function waitCheckerReady(page) {
   await page.waitForFunction(
-    () => document.getElementById('modelLabel')?.textContent?.includes('70 percent'),
-    { timeout: 180000 },
+    () => document.getElementById('modelLabel')?.classList.contains('done'),
+    { timeout: 300000 },
   );
 }
 
@@ -158,12 +158,12 @@ async function main() {
   });
 
   await register(pageA, studentId, password);
-  await waitWhistleReady(pageA);
+  await waitCheckerReady(pageA);
   await pageA.waitForTimeout(5000);
   const sheetUrl = `${BASE}#/book/${BOOK}/unit/${UNIT}`;
   await seedPart2(pageA, suffix);
   await pageA.goto(sheetUrl);
-  await waitWhistleReady(pageA);
+  await waitCheckerReady(pageA);
   await recordTwoLines(pageA);
 
   const localA = await readRushGradesFromPage(pageA, suffix);
@@ -189,10 +189,10 @@ async function main() {
   });
 
   await signIn(pageB, studentId, password);
-  await waitWhistleReady(pageB);
+  await waitCheckerReady(pageB);
   await pageB.waitForTimeout(8000);
   await pageB.goto(sheetUrl);
-  await waitWhistleReady(pageB);
+  await waitCheckerReady(pageB);
   await pageB.waitForTimeout(3000);
 
   const localB = await readRushGradesFromPage(pageB, suffix);

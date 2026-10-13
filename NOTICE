@@ -1,3 +1,4 @@
-Whistle model and Needle engine are Apache License 2.0.
-Source: https://huggingface.co/Cactus-Compute/whistle
-Engine: https://huggingface.co/Cactus-Compute/needle3
+Citrinet int8 ONNX (onnxruntime-web WASM) grades pronunciation in the browser.
+Model: sherpa-onnx-nemo-ctc-en-citrinet-512 (NVIDIA stt_en_citrinet_512, CC-BY-4.0).
+
+Removed from this app: Whistle/Needle, ZIPA, espeak hints, and wav2vec2.

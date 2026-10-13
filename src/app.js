@@ -1,11 +1,11 @@
 import { decodeAudioToMono, audioStats, trimSilence, capSpeechWindow } from './audio.js';
-import { judgeTranscript, loadWhistle, transcribePcm, wordsOf } from './whistle.js?v=20261007-progress-3';
+import { tokenizeWords } from './engine.js?v=20261014-citrinet';
 import { sheetLines } from './sheet.js';
 import {
   createPackSync,
   resolveStudentId,
   storageKeyForStudent,
-} from './whistle-progress.js?v=20261007-progress-3';
+} from './whistle-progress.js?v=20261014-citrinet';
 import {
   FLOW_STORAGE_KEY,
   LOCK_TEXT,
@@ -26,8 +26,15 @@ import {
   timerRunning,
   timerSeconds,
   tryTeacherPassword,
-} from './flow.js?v=20261013-da52';
-import { persistScoredTry } from './score-persist.js?v=20261013-da52';
+} from './flow.js?v=20261014-citrinet';
+import { persistScoredTry } from './score-persist.js?v=20261014-citrinet';
+import {
+  DOOR_CHECKING_TEXT,
+  DOOR_FAIL_TEXT,
+  bootCitrinetOnlyPaths,
+  bootTrialInPage,
+  gradeTrialSamples,
+} from './trial.js?v=20261014-citrinet';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
@@ -35,6 +42,7 @@ const LOCAL_HEAR = new Set([
   'audio/hear/it-is-there.mp3',
 ]);
 const SPEECH_CAP_MS = 30000;
+const CITRINET_PASS = 60;
 const SCORE_KEY = 'day4-pronounce-scores-v2';
 const LANG_KEY = 'day4-ui-lang';
 const UI_LANGS = [
@@ -86,8 +94,8 @@ const modelTrack = typeof document !== 'undefined' ? document.getElementById('mo
 
 let books = [];
 let byId = new Map();
-let whistleModule = null;
 let checkerReady = false;
+let pronounceChecking = false;
 let modelError = '';
 let capture = null;
 let nextTakeId = 1;
@@ -196,13 +204,16 @@ function scoreStorageKey(itemId, partKey) {
 }
 
 function scoringTarget(english) {
-  const toks = wordsOf(english);
-  if (toks.length === 1) return `${toks[0]} ${toks[0]} ${toks[0]}`;
+  const toks = tokenizeWords(english);
+  if (toks.length === 1) {
+    const w = toks[0].display;
+    return `${w} ${w} ${w}`;
+  }
   return english;
 }
 
 function needsTripleHint(english) {
-  return wordsOf(english).length === 1;
+  return tokenizeWords(english).length === 1;
 }
 
 function questionAudioRel(text) {
@@ -310,33 +321,56 @@ function setProgress(frac, text) {
 }
 
 function markModelReady() {
+  modelLabel.classList.add('done');
   modelTrack.classList.add('done');
   exposeBenchHook();
 }
 
-function exposeBenchHook() {
-  if (!checkerReady) return;
+function benchModeEnabled() {
   try {
+    if (new URLSearchParams(location.search).get('bench') === '1') return true;
     const auth = window.MRJ_AUTH;
     const id = auth ? resolveStudentId(auth) : '';
-    if (!String(id).toLowerCase().startsWith('zz_test')) return;
-    window.__mrjPronounceBench = (blob, english) => gradeBlob(blob, english);
-  } catch (_) {}
+    return String(id).toLowerCase().startsWith('zz_test');
+  } catch (_) {
+    return false;
+  }
+}
+
+function exposeBenchHook() {
+  if (!checkerReady) return;
+  if (!benchModeEnabled()) return;
+  window.__mrjPronounceBench = async (blob, english, gradeOpts) => {
+    const passAt = gradeOpts && typeof gradeOpts.passAt === 'number' ? gradeOpts.passAt : CITRINET_PASS;
+    const target = scoringTarget(english);
+    const samples = await decodeAudioToMono(blob, 16000);
+    const graded = await gradeTrialSamples(samples, target, passAt, null, { hints: false });
+    return { result: graded.result, door: graded.door, perf: graded.perf, trialMode: 'citrinet-only' };
+  };
+  window.__mrjTrialBoot = () => ({
+    trialMode: 'citrinet-only',
+    grader: 'citrinet-trial',
+    ready: checkerReady,
+  });
 }
 
 async function bootModel() {
   try {
-    setProgress(0.02, 'Loading Whistle…');
-    whistleModule = await loadWhistle(window.createNeedle, (frac) => {
-      setProgress(0.05 + frac * 0.9, 'Loading Whistle… ' + Math.round(frac * 100) + '%');
+    setProgress(0.02, 'Loading the sound checker…');
+    const wasmPaths = new URL('../vendor/ort/', import.meta.url).href;
+    await bootTrialInPage({
+      wasmPaths,
+      paths: bootCitrinetOnlyPaths(),
+      mode: 'citrinet-only',
+      loadHints: false,
     });
     checkerReady = true;
-    setProgress(1, 'Easy. Words only. Pass at 70 percent in order, or 50 percent of the same words.');
+    setProgress(1, 'Ready. Pass at 60. Say each word clearly.');
     markModelReady();
     render();
   } catch (err) {
     modelError = err && err.message ? err.message : String(err);
-    modelLabel.textContent = 'Whistle did not start. ' + modelError;
+    modelLabel.textContent = 'Sound checker did not start. ' + modelError;
     console.error(err);
     render();
   }
@@ -390,7 +424,7 @@ function renderHome() {
     const prog = bookProgress(book);
     return `<a class="book" href="#/book/${book.id}">${book.label}<small>${prog.pass} / ${prog.n} passed</small></a>`;
   }).join('');
-  appEl.innerHTML = `<h1>Pronounce · Whistle</h1><p class="lead">Tap your book.</p><div class="books">${cards}</div>`;
+  appEl.innerHTML = `<h1>Pronounce · Citrinet</h1><p class="lead">Tap your book.</p><div class="books">${cards}</div>`;
 }
 
 function renderUnits(bookId) {
@@ -452,25 +486,24 @@ function noteCue() {
   return lang === 'ko' ? '이 질문을 한 번만 말하세요.' : 'Say this question one time.';
 }
 
-function wordMatched(word) {
-  if (!word) return false;
-  if (word.match != null) return !!word.match;
-  return (word.score || 0) >= 1;
-}
-
-function wordChipsHtml(words) {
+function wordChipsHtml(words, record) {
   if (!words || !words.length) return '';
+  const citrinet = !!(record && record.grader === 'citrinet-trial');
   const chips = words.map((w) => {
-    const cls = wordMatched(w) ? 'good' : 'bad';
-    return `<span class="word-chip ${cls}">${escapeHtml(w.word)}</span>`;
+    const pct = citrinet ? Math.round(w.score || 0) : Math.round((w.score || 0) * 100);
+    const good = citrinet ? (w.score || 0) >= CITRINET_PASS : (w.score || 0) >= 0.6;
+    const cls = good ? 'good' : 'bad';
+    return `<span class="word-chip ${cls}" title="${pct}%">${escapeHtml(w.word)}</span>`;
   }).join('');
   return `<div class="chips">${chips}</div>`;
 }
 
-function coloredSentenceHtml(english, words) {
+function coloredSentenceHtml(english, words, record) {
   if (!words || !words.length) return escapeHtml(english);
+  const citrinet = !!(record && record.grader === 'citrinet-trial');
   return words.map((w) => {
-    const cls = wordMatched(w) ? 'word-pass' : 'word-fail';
+    const good = citrinet ? (w.score || 0) >= CITRINET_PASS : (w.score || 0) >= 0.6;
+    const cls = good ? 'word-pass' : 'word-fail';
     return `<span class="${cls}">${escapeHtml(w.word)}</span>`;
   }).join(' ');
 }
@@ -499,34 +532,40 @@ function rushMark(flow, id) {
   if (rushChecking.get(id)) return 'checking';
   const grade = flow.rushGrades && flow.rushGrades[id];
   if (!grade) return '';
+  if (grade.doorFail) return 'door';
   return grade.pass ? 'pass' : 'fail';
 }
 
+function checkingLineHtml(active) {
+  if (!active || !pronounceChecking) return '';
+  return `<p class="checking-line">${DOOR_CHECKING_TEXT}</p>`;
+}
+
 function rushFeedbackHtml(shown) {
-  if (!shown || !shown.words || !shown.words.length) return '';
-  return wordChipsHtml(shown.words);
+  if (!shown) return '';
+  if (shown.doorFail) return `<p class="meta">${escapeHtml(shown.reason || DOOR_FAIL_TEXT)}</p>`;
+  if (!shown.words || !shown.words.length) return '';
+  return wordChipsHtml(shown.words, shown);
 }
 
 function englishCueHtml(english, className, saved) {
   const triple = needsTripleHint(english) ? '<p class="triple-hint">Say it 3 times.</p>' : '';
-  const sentence = coloredSentenceHtml(english, saved && saved.words);
-  const heard = saved && saved.heard != null ? `<p class="meta heard">Heard: ${escapeHtml(saved.heard)}</p>` : '';
-  return `<p class="${className}">${sentence}</p>${heard}${triple}`;
+  const sentence = coloredSentenceHtml(english, saved && saved.words, saved);
+  return `<p class="${className}">${sentence}</p>${triple}`;
 }
 
 function partResultHtml(saved) {
   if (!saved) return '';
-  const fallback = saved.scorePct != null ? saved.scorePct : Math.round((saved.score || 0) * 100);
-  const orderPct = saved.orderPct != null ? saved.orderPct : fallback;
-  const samePct = saved.samePct != null ? saved.samePct : fallback;
-  const counts = `<p class="meta">In order: ${orderPct}. Same words: ${samePct}.</p>`;
-  const verdict = saved.pass
-    ? `<p class="verdict pass">PASS</p>${counts}`
-    : `<p class="verdict fail">Not yet</p>${counts}`;
+  if (saved.doorFail) {
+    return `<div class="after show"><p class="meta">${escapeHtml(saved.reason || DOOR_FAIL_TEXT)}</p></div>`;
+  }
+  const pct = saved.scorePct != null ? saved.scorePct : Math.round((saved.score || 0) * 100);
+  const verdict = saved.pass ? 'Pass' : 'Not yet';
+  const cls = saved.pass ? 'pass' : 'fail';
   const reason = saved.reason ? `<p class="meta">${escapeHtml(saved.reason)}</p>` : '';
-  const chips = wordChipsHtml(saved.words);
+  const chips = englishRevealed(saved) ? wordChipsHtml(saved.words, saved) : '';
   return `<div class="after show">
-    ${verdict}
+    <p class="verdict ${cls}">${verdict} · ${pct}</p>
     ${chips}
     ${reason}
   </div>`;
@@ -546,6 +585,7 @@ function askHtml(show) {
 }
 
 function checkHtml(mark) {
+  if (mark === 'door') return '';
   if (mark === 'pass') return '<span class="got-it" aria-label="Pass">✓</span>';
   if (mark === 'fail') return '<span class="not-yet" aria-label="Not yet"><span class="rush-x" aria-hidden="true">✗</span> Not yet</span>';
   if (mark === 'checking') return '<span class="rush-checking">Checking</span>';
@@ -566,7 +606,7 @@ function renderSharedQuestion(bookId, unit, scores, ready, view) {
   const meaningHtml = meaning ? `<p class="l1-prompt">${escapeHtml(meaning)}</p>` : '';
   const result = view.hideVerdict ? '' : partResultHtml(saved);
   const gradingShared = gradingScoreKey === sk && !view.hideVerdict;
-  const gradeBar = gradingShared ? '<div class="grade-bar shared-grade show"><div class="grade-fill"></div></div>' : '';
+  const gradeBar = gradingShared ? `${checkingLineHtml(true)}<div class="grade-bar shared-grade show"><div class="grade-fill"></div></div>` : '';
   const doneCls = saved && saved.pass ? 'done' : '';
   const mic = micButtonHtml(sk, '', '', plan.question, questionAudioRel(plan.question), allowed, ready, view.micLabel);
   return `<section class="shared-q ${doneCls}" data-shared="${escapeHtml(sk)}">
@@ -662,7 +702,7 @@ function lineArticleHtml(line, unit, index, scores, ready, view) {
     body = `<div class="row-main">${single.main}</div><div class="mic-cell">${single.micBtn}</div>`;
     tail = single.result;
   }
-  const gradeBar = grading ? '<div class="grade-bar show"><div class="grade-fill"></div></div>' : '';
+  const gradeBar = grading ? `${checkingLineHtml(true)}<div class="grade-bar show"><div class="grade-fill"></div></div>` : '';
   return `<article class="row" data-id="${escapeHtml(item.id)}">
     <div class="num">${index + 1}</div>
     ${body}
@@ -859,7 +899,7 @@ function renderSheet(bookId, unitId) {
   const scores = flow.attempts || {};
   const wait = modelError
     ? `<p class="note">${escapeHtml(modelError)}</p>`
-    : (ready ? '' : '<p class="note">Whistle is still loading. Mic turns on when the bar finishes.</p>');
+    : (ready ? '' : '<p class="note">The sound checker is still loading. Mic turns on when the bar finishes.</p>');
   const beside = questionCue(unit.title);
   const besideHtml = beside && beside !== unit.title ? `<span class="l1-beside">${escapeHtml(beside)}</span>` : '';
   const back = `<a class="back" href="#/book/${book.id}">← ${escapeHtml(book.label)}</a><h1>${escapeHtml(unit.title)}${besideHtml}</h1>${wait}`;
@@ -1074,21 +1114,29 @@ function studentRecord(graded, gradeText, reason) {
   return {
     score: graded ? graded.score : 0,
     scorePct: graded ? graded.scorePct : 0,
-    orderPct: graded && graded.orderPct != null ? graded.orderPct : 0,
-    samePct: graded && graded.samePct != null ? graded.samePct : 0,
     pass: graded ? !!graded.pass : false,
     weak: graded ? graded.weak : [],
     reason: graded ? graded.reason : reason,
     english: graded ? graded.english : scoringTarget(gradeText),
-    words: graded ? graded.words : [],
-    heard: graded ? graded.heard : '',
+    words: graded && !graded.doorFail ? graded.words : [],
+    doorFail: graded ? !!graded.doorFail : false,
+    grader: graded && graded.grader ? graded.grader : 'citrinet-trial',
     at: Date.now(),
+  };
+}
+
+function doorPassHook(meta) {
+  return {
+    onDoorPass: () => {
+      pronounceChecking = true;
+      if (stillOnSheet(meta.bookId, meta.unitId)) render();
+    },
   };
 }
 
 async function gradeRush(meta, blob) {
   try {
-    const graded = await gradeBlob(blob, meta.gradeText);
+    const graded = await gradeBlob(blob, meta.gradeText, doorPassHook(meta), { hints: false });
     const flow = noteRushGrade(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, graded);
     saveUnitFlow(meta.bookId, meta.unitId, flow);
   } catch (err) {
@@ -1096,6 +1144,7 @@ async function gradeRush(meta, blob) {
     saveUnitFlow(meta.bookId, meta.unitId, flow);
     console.error(err);
   } finally {
+    pronounceChecking = false;
     endRushCheck(meta.scoreKey);
     if (stillOnSheet(meta.bookId, meta.unitId)) render();
   }
@@ -1118,7 +1167,7 @@ async function gradeStudentOrTeacher(meta, blob, serial) {
   let graded = null;
   let thrown = null;
   try {
-    graded = await gradeBlob(blob, meta.gradeText);
+    graded = await gradeBlob(blob, meta.gradeText, doorPassHook(meta), { hints: meta.phase !== 'part2' });
   } catch (err) {
     thrown = err;
     console.error(err);
@@ -1153,6 +1202,7 @@ async function gradeStudentOrTeacher(meta, blob, serial) {
       else await playExpectedOnFail(gradeText, audioRel, graded.pass);
     }
   }
+  pronounceChecking = false;
   releaseGradeBar(meta, serial);
 }
 
@@ -1212,9 +1262,9 @@ async function endPart2(bookId, unitId) {
   if (meta && meta.scoreKey && meta.gradeText) queueBlobScore(meta, null);
 }
 
-async function gradeBlob(blob, english) {
+async function gradeBlob(blob, english, hooks, gradeOpts) {
+  if (!checkerReady) throw new Error('Sound checker is not ready');
   const target = scoringTarget(english);
-  if (!whistleModule) throw new Error('Whistle is not ready');
   const samples = await decodeAudioToMono(blob, 16000);
   const stats = audioStats(samples, 16000);
   if (stats.durationMs < 80) {
@@ -1223,24 +1273,14 @@ async function gradeBlob(blob, english) {
     throw err;
   }
   const trimmed = capSpeechWindow(trimSilence(samples, 16000, 0.006, 80), 16000, SPEECH_CAP_MS);
-  const heard = transcribePcm(whistleModule, trimmed, target);
-  const judged = judgeTranscript(target, heard);
-  let reason = '';
-  if (!judged.pass) {
-    reason = judged.heard ? 'Some words did not match.' : 'No words heard. Say the line again.';
-  }
-  return {
-    score: judged.scorePct / 100,
-    scorePct: judged.scorePct,
-    orderPct: judged.orderPct,
-    samePct: judged.samePct,
-    pass: judged.pass,
-    weak: judged.weak,
-    reason,
-    english: target,
-    words: judged.words,
-    heard: judged.heard,
-  };
+  const graded = await gradeTrialSamples(
+    trimmed,
+    target,
+    CITRINET_PASS,
+    hooks,
+    Object.assign({ hints: false }, gradeOpts || {}),
+  );
+  return graded.result;
 }
 
 function playAudioUrl(url, times = 1) {

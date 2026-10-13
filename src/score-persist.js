@@ -1,4 +1,4 @@
-export const SAVE_FIX_BUILD = '20261013-e5f1';
+export const SAVE_FIX_BUILD = '20261014-citrinet';
 
 export function whistleItemId(itemId) {
   return 'whistle:' + itemId;
@@ -20,7 +20,7 @@ export function gradedCmPostOpts({ itemId, record, student, bookTitle, unitTitle
   return {
     student,
     program: 'pronounce',
-    appName: 'Pronounce · Whistle',
+    appName: 'Pronounce · Citrinet',
     source: 'pronounce',
     itemId: whistleItemId(itemId),
     itemType: 'pronunciation',
@@ -38,7 +38,7 @@ export function attemptErrorCmPostOpts({ itemId, student, bookTitle, unitTitle, 
   return {
     student,
     program: 'pronounce',
-    appName: 'Pronounce · Whistle',
+    appName: 'Pronounce · Citrinet',
     source: 'pronounce',
     itemId: whistleItemId(itemId),
     itemType: 'attempt_error',

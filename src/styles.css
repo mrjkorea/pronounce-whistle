@@ -377,6 +377,13 @@ h1 {
   margin: 8px 0 10px;
 }
 
+.checking-line {
+  margin: 8px 0 6px 78px;
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: var(--blue);
+}
+
 .word-chip {
   border-radius: 999px;
   padding: 0.38rem 0.72rem;
