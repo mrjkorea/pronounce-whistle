@@ -1,4 +1,0 @@
-Citrinet int8 ONNX (onnxruntime-web WASM) grades pronunciation in the browser.
-Model: sherpa-onnx-nemo-ctc-en-citrinet-512 (NVIDIA stt_en_citrinet_512, CC-BY-4.0).
-
-Removed from this app: Whistle/Needle, ZIPA, espeak hints, and wav2vec2.
