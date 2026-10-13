@@ -431,6 +431,28 @@ h1 {
   line-height: 1;
 }
 
+.not-yet {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fail);
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.rush-x {
+  font-size: 36px;
+  line-height: 1;
+}
+
+.rush-checking {
+  color: var(--blue);
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+}
+
 .rush {
   display: flex;
   flex-wrap: wrap;

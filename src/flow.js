@@ -5,6 +5,8 @@ export const LEGACY_SCORE_KEY = 'day4-pronounce-scores-v2';
 export const LOCK_AT = 5;
 export const LOCK_TEXT = 'Please ask your teacher for help.';
 export const TEACHER_PASSWORD = 'MRJ';
+/** Part 2 rush timer — fixed classroom limit (seconds). */
+export const PART2_LIMIT_SEC = 120;
 
 export function emptyFlow() {
   return {
@@ -17,7 +19,7 @@ export function emptyFlow() {
     rushGrades: {},
     part2: {
       wordCount: 0,
-      limitSec: 60,
+      limitSec: PART2_LIMIT_SEC,
       startedAt: 0,
       stoppedAt: 0,
       secondsUsed: null,
@@ -38,7 +40,7 @@ export function normalizeFlow(raw) {
   const base = emptyFlow();
   if (!raw || typeof raw !== 'object') return base;
   const phase = raw.phase === 'teacher' || raw.phase === 'part2' || raw.phase === 'results' ? raw.phase : 'part1';
-  const limit = raw.part2 && Number(raw.part2.limitSec) === 90 ? 90 : 60;
+  const limit = PART2_LIMIT_SEC;
   const seconds = raw.part2 && raw.part2.secondsUsed != null ? whole(raw.part2.secondsUsed) : null;
   return {
     phase,
@@ -68,9 +70,9 @@ export function sumWords(texts) {
   return (texts || []).reduce((n, text) => n + countWords(text), 0);
 }
 
-/** More than 50 English words → 90 seconds. 50 or fewer → 60. */
-export function timerSeconds(wordCount) {
-  return wordCount > 50 ? 90 : 60;
+/** Part 2 always uses the fixed classroom timer. */
+export function timerSeconds(_wordCount) {
+  return PART2_LIMIT_SEC;
 }
 
 export function isLocked(flow, id) {
@@ -119,9 +121,30 @@ export function markRushRecorded(flow, id) {
   return Object.assign({}, flow, { rushRecorded });
 }
 
+function storedRushWords(graded) {
+  const list = graded && Array.isArray(graded.words) ? graded.words : [];
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const row = list[i];
+    if (!row || !row.word) continue;
+    const score = Number(row.score);
+    const item = { word: String(row.word), score: Number.isFinite(score) ? score : 0 };
+    if (row.hint) item.hint = String(row.hint);
+    out.push(item);
+  }
+  return out;
+}
+
 export function noteRushGrade(flow, id, graded) {
   const rushGrades = Object.assign({}, flow.rushGrades, {
-    [id]: { pass: !!(graded && graded.pass), scorePct: graded && graded.scorePct ? graded.scorePct : 0 },
+    [id]: {
+      pass: !!(graded && graded.pass),
+      scorePct: graded && graded.scorePct ? graded.scorePct : 0,
+      words: storedRushWords(graded),
+      doorFail: !!(graded && graded.doorFail),
+      reason: graded && graded.doorFail ? (graded.reason || '') : '',
+      grader: graded && graded.grader ? graded.grader : '',
+    },
   });
   return Object.assign({}, flow, { rushGrades });
 }
@@ -200,10 +223,11 @@ export function reconcileFlow(flow, now) {
 
 /**
  * Next mic policy.
- * A running score does not block the next mic. The fail sound does not either.
- * Recording still means one take at a time: stop that take before another starts.
+ * A grade, a fail sound, or rushInFlight does not block the next mic.
+ * A recording still blocks, because only one take runs at a time.
+ * Part 2 also needs the timer to be running.
  */
-export function canStartMic({ phase, recording, timerRunning: running, lineOpen }) {
+export function canStartMic({ phase, recording, timerRunning: running, lineOpen, grading: _grading }) {
   if (lineOpen === false) return false;
   if (recording) return false;
   if (phase === 'part1' || phase === 'teacher') return true;
@@ -214,7 +238,12 @@ export function canStartMic({ phase, recording, timerRunning: running, lineOpen 
 export function lineOpenFor(flow, id) {
   if (flow.phase === 'part1') return !isLocked(flow, id) && !studentPassed(flow, id);
   if (flow.phase === 'teacher') return stuckIds(flow, [id]).length === 1;
-  if (flow.phase === 'part2') return true;
+  if (flow.phase === 'part2') {
+    if (!timerRunning(flow)) return false;
+    const grade = flow.rushGrades[id];
+    if (grade && grade.pass) return false;
+    return true;
+  }
   return false;
 }
 
@@ -224,10 +253,12 @@ export function resultsView(flow, lines) {
   const teacherSaid = [];
   let passed = 0;
   let recorded = 0;
+  let rushPassed = 0;
   for (let i = 0; i < list.length; i++) {
     const line = list[i];
     if (studentPassed(flow, line.id)) passed += 1;
     if (flow.rushRecorded[line.id]) recorded += 1;
+    if (flow.rushGrades[line.id] && flow.rushGrades[line.id].pass) rushPassed += 1;
     if (flow.teacher[line.id] === 'skipped') {
       skipped.push({ id: line.id, label: line.korean || line.id, mark: 'skipped' });
     } else if (flow.teacher[line.id] === 'passed') {
@@ -238,6 +269,7 @@ export function resultsView(flow, lines) {
     secondsUsed: flow.part2.secondsUsed == null ? 0 : flow.part2.secondsUsed,
     limitSec: flow.part2.limitSec,
     recorded,
+    rushPassed,
     total: list.length,
     passed,
     skipped,
