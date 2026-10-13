@@ -7,6 +7,8 @@ export const SCORE_PROGRAM = 'pronounce';
 export const WHISTLE_ITEM_PREFIX = 'whistle:';
 export const REMOTE_SAVE_MS = 17000;
 export const PACK_LOAD_RETRY_DELAYS_MS = [0, 1500, 3000];
+/** Keep in sync with flow.js PART2_LIMIT_SEC (pack merge must not downgrade to 60/90). */
+export const PACK_PART2_LIMIT_SEC = 120;
 
 export function delayMs(ms, delayFn) {
   const wait = delayFn || ((n) => new Promise((resolve) => { setTimeout(resolve, n); }));
@@ -180,7 +182,7 @@ function mergePart2(a, b) {
   const other = pick === left ? right : left;
   return {
     wordCount: Math.max(whole(left.wordCount), whole(right.wordCount)),
-    limitSec: pick.limitSec === 90 || other.limitSec === 90 ? 90 : 60,
+    limitSec: PACK_PART2_LIMIT_SEC,
     startedAt: Math.max(whole(left.startedAt), whole(right.startedAt)),
     stoppedAt: Math.max(whole(left.stoppedAt), whole(right.stoppedAt)),
     secondsUsed: pick.secondsUsed != null ? pick.secondsUsed : other.secondsUsed,
