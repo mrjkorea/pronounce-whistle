@@ -26,8 +26,8 @@ import {
   timerRunning,
   timerSeconds,
   tryTeacherPassword,
-} from './flow.js?v=20261007-progress-3';
-import { persistScoredTry } from './score-persist.js?v=20261011-savefix';
+} from './flow.js?v=20261013-da52';
+import { persistScoredTry } from './score-persist.js?v=20261013-da52';
 
 const HEAR_BASE = 'https://mrjkorea.github.io/day4-speak/';
 const LOCAL_HEAR = new Set([
@@ -100,6 +100,7 @@ let scoreTail = Promise.resolve();
 let clockTimer = null;
 let teacherMiss = {};
 let activeStudentSuffix = '';
+const rushChecking = new Map();
 
 const packSync = typeof localStorage !== 'undefined' ? createPackSync({
   storage: localStorage,
@@ -310,6 +311,17 @@ function setProgress(frac, text) {
 
 function markModelReady() {
   modelTrack.classList.add('done');
+  exposeBenchHook();
+}
+
+function exposeBenchHook() {
+  if (!checkerReady) return;
+  try {
+    const auth = window.MRJ_AUTH;
+    const id = auth ? resolveStudentId(auth) : '';
+    if (!String(id).toLowerCase().startsWith('zz_test')) return;
+    window.__mrjPronounceBench = (blob, english) => gradeBlob(blob, english);
+  } catch (_) {}
 }
 
 async function bootModel() {
@@ -467,6 +479,34 @@ function englishRevealed(saved) {
   return !!saved;
 }
 
+function shownGrade(view, key, saved) {
+  if (view && view.rush) return (view.rushGrades && view.rushGrades[key]) || null;
+  if (view && view.forceHideEnglish) return null;
+  return saved || null;
+}
+
+function beginRushCheck(id) {
+  rushChecking.set(id, (rushChecking.get(id) || 0) + 1);
+}
+
+function endRushCheck(id) {
+  const left = (rushChecking.get(id) || 1) - 1;
+  if (left <= 0) rushChecking.delete(id);
+  else rushChecking.set(id, left);
+}
+
+function rushMark(flow, id) {
+  if (rushChecking.get(id)) return 'checking';
+  const grade = flow.rushGrades && flow.rushGrades[id];
+  if (!grade) return '';
+  return grade.pass ? 'pass' : 'fail';
+}
+
+function rushFeedbackHtml(shown) {
+  if (!shown || !shown.words || !shown.words.length) return '';
+  return wordChipsHtml(shown.words);
+}
+
 function englishCueHtml(english, className, saved) {
   const triple = needsTripleHint(english) ? '<p class="triple-hint">Say it 3 times.</p>' : '';
   const sentence = coloredSentenceHtml(english, saved && saved.words);
@@ -505,9 +545,11 @@ function askHtml(show) {
   return `<p class="ask-teacher">${escapeHtml(text)}</p>`;
 }
 
-function checkHtml(show) {
-  if (!show) return '';
-  return '<span class="got-it" aria-label="Recorded">✓</span>';
+function checkHtml(mark) {
+  if (mark === 'pass') return '<span class="got-it" aria-label="Pass">✓</span>';
+  if (mark === 'fail') return '<span class="not-yet" aria-label="Not yet"><span class="rush-x" aria-hidden="true">✗</span> Not yet</span>';
+  if (mark === 'checking') return '<span class="rush-checking">Checking</span>';
+  return '';
 }
 
 function renderSharedQuestion(bookId, unit, scores, ready, view) {
@@ -517,21 +559,22 @@ function renderSharedQuestion(bookId, unit, scores, ready, view) {
   const sk = sharedScoreKey(bookId, unit.id);
   const saved = scores[sk];
   const allowed = view.allow ? !!view.allow[sk] : !!ready;
-  const hideEnglish = !!view.forceHideEnglish;
-  const prompt = !hideEnglish && englishRevealed(saved) ? englishCueHtml(plan.question, 'en-prompt', saved) : '';
+  const shown = shownGrade(view, sk, saved);
+  const prompt = englishRevealed(shown) ? englishCueHtml(plan.question, 'en-prompt', shown) : '';
+  const rushMarks = view.rush && englishRevealed(shown) ? rushFeedbackHtml(shown) : '';
   const meaning = questionCue(plan.question);
   const meaningHtml = meaning ? `<p class="l1-prompt">${escapeHtml(meaning)}</p>` : '';
   const result = view.hideVerdict ? '' : partResultHtml(saved);
   const gradingShared = gradingScoreKey === sk && !view.hideVerdict;
   const gradeBar = gradingShared ? '<div class="grade-bar shared-grade show"><div class="grade-fill"></div></div>' : '';
   const doneCls = saved && saved.pass ? 'done' : '';
-  const recorded = view.recorded && view.recorded[sk];
   const mic = micButtonHtml(sk, '', '', plan.question, questionAudioRel(plan.question), allowed, ready, view.micLabel);
   return `<section class="shared-q ${doneCls}" data-shared="${escapeHtml(sk)}">
     <p class="shared-note">${escapeHtml(noteCue())}</p>
     ${meaningHtml}
     ${prompt}
-    <div class="mic-cell">${checkHtml(recorded)}${mic}</div>
+    ${rushMarks}
+    <div class="mic-cell">${checkHtml(view.marks && view.marks[sk])}${mic}</div>
     ${askHtml(view.locked && view.locked[sk])}
     ${result}
     ${gradeBar}
@@ -581,16 +624,18 @@ function lineArticleHtml(line, unit, index, scores, ready, view) {
     const skey = scoreStorageKey(item.id, p.key);
     const saved = scores[skey];
     const allowed = view.allow ? !!view.allow[skey] : !!ready;
-    const revealed = !view.forceHideEnglish && englishRevealed(saved);
-    const cue = revealed ? englishCueHtml(p.english, 'part-text', saved) : '';
+    const shown = shownGrade(view, skey, saved);
+    const revealed = englishRevealed(shown);
+    const cue = revealed ? englishCueHtml(p.english, 'part-text', shown) : '';
+    const rushMarks = view.rush && revealed ? rushFeedbackHtml(shown) : '';
     const audioRel = p.audio || questionAudioRel(p.english);
     const micBtn = micButtonHtml(skey, item.id, p.key, p.english, audioRel, allowed, ready, view.micLabel);
-    const recorded = checkHtml(view.recorded && view.recorded[skey]);
+    const recorded = checkHtml(view.marks && view.marks[skey]);
     const ask = askHtml(view.locked && view.locked[skey]);
     const result = view.hideVerdict ? '' : partResultHtml(saved);
     if (!multi) {
       return {
-        main: koHtml(lineCue(item), imageRel, line.local, cue + ask),
+        main: koHtml(lineCue(item), imageRel, line.local, cue + rushMarks + ask),
         micBtn: recorded + micBtn,
         saved,
         result,
@@ -601,6 +646,7 @@ function lineArticleHtml(line, unit, index, scores, ready, view) {
       <div>
         ${label}
         ${cue}
+        ${rushMarks}
         ${ask}
         ${result}
       </div>
@@ -678,7 +724,7 @@ function speakWordCount(bookId, unit) {
 function sheetView(flow, targets) {
   const allow = {};
   const locked = {};
-  const recorded = {};
+  const marks = {};
   const running = timerRunning(flow);
   for (let i = 0; i < targets.length; i++) {
     const id = targets[i].id;
@@ -689,13 +735,15 @@ function sheetView(flow, targets) {
       lineOpen: lineOpenFor(flow, id),
     });
     if (flow.phase === 'part1' && isLocked(flow, id)) locked[id] = true;
-    if (flow.rushRecorded[id]) recorded[id] = true;
+    if (flow.phase === 'part2' || flow.phase === 'results') marks[id] = rushMark(flow, id);
   }
   const rush = flow.phase === 'part2' || flow.phase === 'results';
   return {
     allow,
     locked,
-    recorded,
+    marks,
+    rush,
+    rushGrades: flow.rushGrades || {},
     forceHideEnglish: flow.phase !== 'part1',
     hideVerdict: rush,
     micLabel: flow.phase === 'teacher' ? 'Teacher mic' : 'Mic',
@@ -703,7 +751,7 @@ function sheetView(flow, targets) {
 }
 
 function clockSeconds(flow, now) {
-  const limit = flow.part2.limitSec || 60;
+  const limit = flow.part2.limitSec || timerSeconds(0);
   if (!flow.part2.startedAt || flow.part2.stoppedAt || flow.phase === 'results') return limit;
   const leftMs = limit * 1000 - (now - flow.part2.startedAt);
   return Math.max(0, Math.ceil(leftMs / 1000));
@@ -717,6 +765,7 @@ function resultsHtml(flow, targets) {
     <h2>Results</h2>
     <p>Seconds used: ${view.secondsUsed}. Limit ${view.limitSec}.</p>
     <p>Recorded ${view.recorded} / ${view.total}</p>
+    <p>Part 2 pronunciation: ${view.rushPassed} passed</p>
     <p>Part 1 pronunciation: ${view.passed} passed</p>
     ${skips}
     ${said}
@@ -737,7 +786,7 @@ function rushBarHtml(flow) {
 }
 
 function timerSecondsSafe(flow) {
-  return flow.part2.limitSec === 90 ? 90 : 60;
+  return flow.part2.limitSec || timerSeconds(0);
 }
 
 function teacherMeaning(target) {
@@ -1046,6 +1095,9 @@ async function gradeRush(meta, blob) {
     const flow = noteRushGrade(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey, { pass: false, scorePct: 0 });
     saveUnitFlow(meta.bookId, meta.unitId, flow);
     console.error(err);
+  } finally {
+    endRushCheck(meta.scoreKey);
+    if (stillOnSheet(meta.bookId, meta.unitId)) render();
   }
 }
 
@@ -1113,7 +1165,10 @@ function queueBlobScore(meta, serial) {
       console.error(err);
     }
     if (!blob) {
-      if (serial != null) releaseGradeBar(meta, serial);
+      if (meta.phase === 'part2') {
+        endRushCheck(meta.scoreKey);
+        if (stillOnSheet(meta.bookId, meta.unitId)) render();
+      } else if (serial != null) releaseGradeBar(meta, serial);
       return;
     }
     if (meta.phase === 'part2') {
@@ -1129,6 +1184,7 @@ function finishTake(expectedId) {
   const meta = claimCapture();
   if (!meta || !meta.scoreKey || !meta.gradeText) return;
   if (meta.phase === 'part2') {
+    beginRushCheck(meta.scoreKey);
     const flow = markRushRecorded(loadUnitFlow(meta.bookId, meta.unitId), meta.scoreKey);
     saveUnitFlow(meta.bookId, meta.unitId, flow);
     if (stillOnSheet(meta.bookId, meta.unitId)) render();
@@ -1146,7 +1202,10 @@ async function endPart2(bookId, unitId) {
   if (cur.phase !== 'part2' || !cur.part2.startedAt || cur.part2.stoppedAt) return;
   const meta = claimCapture();
   let flow = loadUnitFlow(bookId, unitId);
-  if (meta && meta.scoreKey) flow = markRushRecorded(flow, meta.scoreKey);
+  if (meta && meta.scoreKey) {
+    beginRushCheck(meta.scoreKey);
+    flow = markRushRecorded(flow, meta.scoreKey);
+  }
   flow = stopTimer(flow, Date.now());
   saveUnitFlow(bookId, unitId, flow);
   if (stillOnSheet(bookId, unitId)) render();
@@ -1381,6 +1440,7 @@ if (appEl) {
           return previousSignOut();
         };
       }
+      exposeBenchHook();
       void packSync.onAuthReady((ev && ev.detail) || {});
     });
   }
